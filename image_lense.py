@@ -58,13 +58,15 @@ def angles_to_pixel(picture_dimension: tuple[int, int], angles: tuple[float, flo
         pixel_coordinate (tuple(int, int)): current pixel wanna convert into angle in (i, j)
     """
     width, height = picture_dimension
-    alpha_x, alpha = angles
+    alpha_x, alpha_y = angles
 
-    i_unit = np.tan(alpha_x) / np.tan(fov / 2)
-    i = int((i_unit + 1) * (width / 2))
+    # Normalize angles to [-1, 1] using pinhole projection
+    x_unit = np.tan(alpha_x) / np.tan(fov / 2)
+    y_unit = np.tan(alpha_y) / np.tan(fov / 2)
 
-    j_unit = np.tan(np.arccos(np.cos(alpha) / np.cos(alpha_x))) / np.tan(fov / 2)
-    j = int((j_unit + 1) * (height / 2))
+    # Convert to pixel coordinates
+    i = int((x_unit + 1) * 0.5 * width)
+    j = int((y_unit + 1) * 0.5 * height)
 
     return j, i
 
@@ -141,6 +143,9 @@ def main():
     
     for j in range(height):
         for i in range(width):
+            # debug print
+            print(f"Processing pixel ({i+1}, {j+1}) / ({width}, {height})", end='\r')
+            
             lensed_image[j, i] = get_pixel_color(
                 r_obs,
                 *pixel_to_angels((width, height), (i, j), fov),
