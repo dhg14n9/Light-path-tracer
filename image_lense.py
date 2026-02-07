@@ -70,6 +70,7 @@ def angles_to_pixel(picture_dimension: tuple[int, int], angles: tuple[float, flo
 
     return j, i
 
+ray_cache: dict[float, float] = {}
 
 def get_final_ray_angle(r_obs: float, alpha: float) -> float:
     """
@@ -84,6 +85,11 @@ def get_final_ray_angle(r_obs: float, alpha: float) -> float:
         float: Final angle after the photon escapes
     """
     
+    # check cache 
+    key = round(alpha, 10)
+    if key in ray_cache:
+        return ray_cache[key]
+    
     solution, _ = trace_ray(r_obs, alpha)
     r = solution.y[1] # type: ignore
     phi = solution.y[2] # type: ignore
@@ -93,6 +99,8 @@ def get_final_ray_angle(r_obs: float, alpha: float) -> float:
     
     dx = x[-1] - x[-2]
     dy = y[-1] - y[-2]
+    
+    ray_cache[key] = np.arctan2(dy, dx)
     
     return np.arctan2(dy, dx)
     
@@ -120,6 +128,7 @@ def get_pixel_color(r_obs: float, alpha: float, theta: float, background_image: 
     final_angle = get_final_ray_angle(r_obs, alpha)
     j_final, i_final = angles_to_pixel(background_image.shape[1::-1], (theta, final_angle), fov)
     
+    
     return background_image[j_final % background_image.shape[0], i_final % background_image.shape[1]]
     
 
@@ -137,14 +146,12 @@ def main():
     lensed_image = np.zeros_like(img)
     
     # obesrver properties
-    r_obs = 50.0 * M
+    r_obs = 100.0 * M
     fov_deg = 40.0
     fov: float = np.radians(fov_deg)
     
     for j in range(height):
         for i in range(width):
-            # debug print
-            print(f"Processing pixel ({i+1}, {j+1}) / ({width}, {height})", end='\r')
             
             lensed_image[j, i] = get_pixel_color(
                 r_obs,
