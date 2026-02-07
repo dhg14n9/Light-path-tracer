@@ -1,0 +1,21 @@
+# python
+__pycache__/
+*.pyc
+
+# virtual environment
+.venv/
+venv/
+env/
+
+# vscode workspace settings
+.vscode/
+*.code-workspace
+
+# OS junks
+.DS_Store
+Thumbs.db
+
+# just any image files
+*.png
+*.jpg
+*.jpeg
