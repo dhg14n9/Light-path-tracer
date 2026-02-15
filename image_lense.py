@@ -1,76 +1,86 @@
+# Every set of coordinate is written as (y, x)
+# FOV pairs: (horizontal, vertical)
+
 import numpy as np
 import matplotlib.image as mpimg
+from tqdm import tqdm
 
 from geodesic_tracer import (
     M, R_S, R_PHOTON, B_CRIT,
     trace_ray, viewing_angle_to_impact_parameter
 )
 
-
-
-def pixel_to_viewing_angle(i: int, n: int, fov: float) -> float:
+def pixel_to_angles(pixel: tuple[int, int], image_dimension: tuple[int, int], fov: tuple[float, float]) -> tuple[float, float]:
     """
-    Taking the pixel and dimension of the image plane, converting it to viewing angle in a specific direction (x, y)
-
-    Args:
-        i (int): current pixel wanna convert into angle
-        n (int): dimension of the image plane in the direction of i
-        fov (float): Field of view angle
-
-    Returns:
-        angle (float): angle viewing the pixel i (in radian)
-    """
+    This function takes in the pixel coordinates, the image dimensions, and fov and
+    returns the corresponding angles (alpha, theta) for the given pixel.
     
-    i_unit: float = (i - n/2) / (n/2)
-    return np.arctan(i_unit * np.tan(fov / 2))
-
-def pixel_to_angels(picture_dimension: tuple[int, int], pixel_coordinate: tuple[int, int], fov: float) -> tuple[float, float]:
-    """
-    Taking the pixel and dimension of the image plane, converting it to angle theta and alpha in radian (an image will be provided later for better understanding)
-
     Args:
-        picture_dimension (tuple(int, int)): dimension of the image plane in (width, height)
-        pixel_coordinate (tuple(int, int)): current pixel wanna convert into angle in (i, j)
-        fov (float): Field of view angle
+        pixel (tuple[int, int]): The coordinate of the pixel in the image
+        image_dimension (tuple[int, int]): Dimension of the image (height, width)
+        fov (tuple[float, float]): Field of view in radians (horizontal, vertical)
 
     Returns:
-        angle (tuple(float, float)): angle viewing the pixel (i, j) in (theta, phi) (in radian)
+        tuple[float, float]: The corresponding angles (alpha, theta) for the given pixel
     """
-    width, height = picture_dimension
-    i, j = pixel_coordinate
+    height, width = image_dimension
+    horizontal_fov, vertical_fov = fov
 
-    alpha_x = pixel_to_viewing_angle(i, width, fov)
-    alpha_y = pixel_to_viewing_angle(j, height, fov)
+    x = pixel[1] - width / 2
+    y = pixel[0] - height / 2
+
+    fx = (width / 2) / np.tan(horizontal_fov / 2)
+    fy = (height / 2) / np.tan(vertical_fov / 2)
+
+    x_cam = x / fx
+    y_cam = y / fy
+
+    alpha = np.arctan2(np.sqrt(x_cam**2 + y_cam**2), 1.0)
+    theta = np.arctan2(x_cam, y_cam)
+    return (alpha, theta)
 
 
-    return alpha_x, np.arccos(np.cos(alpha_x) * np.cos(alpha_y))
-
-def angles_to_pixel(picture_dimension: tuple[int, int], angles: tuple[float, float], fov: float) -> tuple[int, int]:
+def angles_to_pixel(angles: tuple[float, float], image_dimension: tuple[int, int], fov: tuple[float, float], clip: bool = False) -> tuple[int, int]:
     """
-    Taking the angle theta and phi in radian, converting it to pixel coordinate in the image plane (an image will be provided later for better understanding)
+    Inverse of ``pixel_to_angles``: convert (alpha, theta) back to pixel (y, x).
 
     Args:
-        picture_dimension (tuple(int, int)): dimension of the image plane in (width, height)
-        angles (tuple(float, float)): angle viewing the pixel (i, j) in (theta, alpha) (in radian)
-        fov (float): Field of view angle
+        angles (tuple[float, float]): (alpha, theta) in radians.
+        image_dimension (tuple[int, int]): Image dimension (height, width).
+        fov (tuple[float, float]): Field of view in radians (horizontal, vertical).
+        clip (bool): Clamp output pixel to image bounds if True.
 
     Returns:
-        pixel_coordinate (tuple(int, int)): current pixel wanna convert into angle in (i, j)
+        tuple[int, int]: Pixel coordinate (y, x).
     """
-    width, height = picture_dimension
-    alpha_x, alpha_y = angles
+    alpha, theta = angles
+    height, width = image_dimension
+    horizontal_fov, vertical_fov = fov
 
-    # Normalize angles to [-1, 1] using pinhole projection
-    x_unit = np.tan(alpha_x) / np.tan(fov / 2)
-    y_unit = np.tan(alpha_y) / np.tan(fov / 2)
+    fx = (width / 2) / np.tan(horizontal_fov / 2)
+    fy = (height / 2) / np.tan(vertical_fov / 2)
 
-    # Convert to pixel coordinates
-    i = int((x_unit + 1) * 0.5 * width)
-    j = int((y_unit + 1) * 0.5 * height)
+    r_cam = np.tan(alpha)
+    x_cam = r_cam * np.sin(theta)
+    y_cam = r_cam * np.cos(theta)
 
-    return j, i
+    x = x_cam * fx
+    y = y_cam * fy
 
-ray_cache: dict[float, float] = {}
+    px = int(np.rint(x + width / 2))
+    py = int(np.rint(y + height / 2))
+
+    if clip:
+        # TODO: This clipping is not yet perfect (I think)
+        px = int(np.clip(px, 0, width - 1))
+        py = int(np.clip(py, 0, height - 1))
+        pass
+
+    return (py, px)
+
+
+
+ray_cache = {}
 
 def get_final_ray_angle(r_obs: float, alpha: float) -> float:
     """
@@ -86,7 +96,7 @@ def get_final_ray_angle(r_obs: float, alpha: float) -> float:
     """
     
     # check cache 
-    key = round(alpha, 10)
+    key = round(alpha, 5)
     if key in ray_cache:
         return ray_cache[key]
     
@@ -103,41 +113,46 @@ def get_final_ray_angle(r_obs: float, alpha: float) -> float:
     ray_cache[key] = np.arctan2(dy, dx)
     
     return np.arctan2(dy, dx)
-    
 
 
-def get_pixel_color(r_obs: float, alpha: float, theta: float, background_image: np.ndarray, fov: float) -> np.ndarray:
+#! As I implement the alpha first look up table this function will become obsolete
+def get_color_from_background(angles: tuple[float, float], background_image: np.ndarray, fov: tuple[float, float], r_obs: float) -> np.ndarray:
     """
-    This function takes in the parameters and determine the color of the background image that the traced ray will hit
+    This function takes in the final angles (alpha, theta) of the photon after escaping and returns the corresponding color from the background image.
 
     Args:
-        r_obs (float): Distance of the observer from the black hole center
-        alpha (float): viewing angle (see image for better understanding)
-        theta (float): viewing angle (see image for better understanding)
-        background_image (np.ndarray): Background image 
-        fov (float): Field of view
+        angles (tuple[float, float]): (alpha, theta) in radians (initial angles from the observer).
+        background_image (np.ndarray): Background image array.
+        fov (tuple[float, float]): Field of view in radians (horizontal, vertical).
 
     Returns:
-        np.ndarray: Color of the pixel that the photon hits
+        np.ndarray: Color of the pixel in the background image corresponding to the given angles.
     """
-    # filter out all the rays that falls into the black hole
+    
+    # check if the rays will actually escape the black hole
+    alpha, theta = angles
     b = viewing_angle_to_impact_parameter(alpha, r_obs)
     if b < B_CRIT:
-        return np.array([0.0, 0.0, 0.0])  
+        return np.array([0.0, 0.0, 0.0])
     
     final_angle = get_final_ray_angle(r_obs, alpha)
-    j_final, i_final = angles_to_pixel(background_image.shape[1::-1], (theta, final_angle), fov)
+    final_pixel = angles_to_pixel((final_angle, theta), background_image.shape[:2], fov)
     
+    # for debugging purposes, returns a specific color if the ray escapes but goes out of bounds of the background image
+    if final_pixel[0] < 0 or final_pixel[0] >= background_image.shape[0] or final_pixel[1] < 0 or final_pixel[1] >= background_image.shape[1]:
+        return np.array([1.0, 0.0, 1.0])
     
-    return background_image[j_final % background_image.shape[0], i_final % background_image.shape[1]]
-    
+    return background_image[final_pixel]
+
+
+
 
 
 def main(): 
     # load image
     img = mpimg.imread('image.jpg')
     
-    if img.dtype == np.float32 or img.dtype == np.float64:
+    if img.dtype == np.uint8:
         img = img.astype(np.float32) / 255.0
     
     height, width = img.shape[:2]
@@ -147,24 +162,70 @@ def main():
     
     # obesrver properties
     r_obs = 100.0 * M
-    fov_deg = 40.0
-    fov: float = np.radians(fov_deg)
+    vertical_fov_deg = 40.0
     
-    for j in range(height):
-        for i in range(width):
+    vertical_fov: float = np.radians(vertical_fov_deg)
+    horizontal_fov = 2 * np.arctan(np.tan(vertical_fov / 2) * width / height)
+    fov = (horizontal_fov, vertical_fov)
+    
+    render_loop_around: bool = False # poor naming, I don't really know how to call this variable. If True, when the ray lands outside the bounds of the background image, it will be tiled instead of being marked as out of bounds.
+    
+    # alpha lookup table
+    alpha_lookup: dict[tuple[int, int], float] = {}
+    for y in range(height):
+        for x in range(width):
+            alpha = round(pixel_to_angles((y, x), (height, width), fov)[0], 4)
+            if alpha < viewing_angle_to_impact_parameter(B_CRIT, r_obs):
+                continue
             
-            lensed_image[j, i] = get_pixel_color(
-                r_obs,
-                *pixel_to_angels((width, height), (i, j), fov),
-                img,
-                fov
-            )
+            alpha_lookup[(y, x)] = alpha
     
-    # save lensed image
+    unique_alpha = set(alpha_lookup.values())
+    
+    final_alpha_lookup: dict[float, float] = {}
+    for alpha in tqdm(unique_alpha, desc="Precomputing alpha lookup", unit="alpha"):
+        final_alpha_lookup[alpha] = get_final_ray_angle(r_obs, alpha)
+    
+    # render output image
+    for y in tqdm(range(height), desc="Rendering", unit="row"):
+        for x in range(width):
+            alpha = alpha_lookup[(y, x)]
+            if alpha < viewing_angle_to_impact_parameter(B_CRIT, r_obs):
+                lensed_image[y, x] = np.array([0.0, 0.0, 0.0])
+                continue
+            
+            final_alpha = final_alpha_lookup[alpha]
+            theta = pixel_to_angles((y, x), (height, width), fov)[1]
+            final_pixel = angles_to_pixel((final_alpha, theta), img.shape[:2], fov)
+            
+            # for debugging purposes, returns a specific color if the ray escapes but goes out of bounds of the background image
+            if not render_loop_around:
+                if final_pixel[0] < 0 or final_pixel[0] >= img.shape[0] or final_pixel[1] < 0 or final_pixel[1] >= img.shape[1]:
+                    lensed_image[y, x] = np.array([1.0, 0.0, 1.0])
+                    continue
+            else:
+                # Tile the background image when the ray lands outside bounds.
+                final_pixel = (
+                    final_pixel[0] % img.shape[0],
+                    final_pixel[1] % img.shape[1],
+                )
+            
+            color = img[final_pixel]
+            lensed_image[y, x] = color
+    
+    
+    """
+    ! As I implement the alpha first look up table, this loop will become obsolete and will be replaced by a simple lookup from the precomputed table.
+    for y in tqdm(range(height), desc="Rendering", unit="row"):
+        for x in range(width):
+            angles = pixel_to_angles((y, x), (height, width), fov)
+            color = get_color_from_background(angles, img, fov, r_obs)
+            lensed_image[y, x] = color
+    """
+    
+    
+    # save output image
     mpimg.imsave('lensed_image.png', lensed_image)
-
-
 
 if __name__ == "__main__":
     main()
-
