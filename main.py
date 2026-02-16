@@ -31,8 +31,8 @@ def main():
     print(f"Outcome:            {outcome.upper()}")
 
     # Extract trajectory
-    r = solution.y[1] 
-    phi = solution.y[2]
+    r = solution.y[1] # type: ignore
+    phi = solution.y[2] #type: ignore
     x = r * np.cos(phi)
     y = r * np.sin(phi)
 
