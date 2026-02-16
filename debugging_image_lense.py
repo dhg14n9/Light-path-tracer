@@ -7,6 +7,7 @@ from time import perf_counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import os
 import resource
+import shutil
 import sys
 
 from geodesic_tracer import (
@@ -107,7 +108,7 @@ def resolve_worker_count(num_worker: int | None) -> int:
     else:
         detected = os.cpu_count()
 
-    return max(1, int(detected or 1))
+    return max(1, int(detected or 1)) # type: ignore
 
 
 def _get_clock_ticks_per_second() -> int:
@@ -198,15 +199,151 @@ def print_live_resource_usage(
         cpu_percent = (cpu_cores / max(1, logical_cores_available)) * 100.0
         cpu_label = f"{cpu_cores:5.2f} cores ({cpu_percent:5.1f}%)"
 
-    line = (
+    full_line = (
         f"[{stage}] |{progress_bar}| {progress_percent:6.2f}% ({completed:,}/{total:,}) "
         f"| live_cpu_usage={cpu_label} "
         f"| live_ram_usage={format_bytes(ram_bytes)}"
     )
-    previous_length = getattr(print_live_resource_usage, "_last_line_length", 0)
-    padding = " " * max(0, previous_length - len(line))
-    print(f"\r{line}{padding}", end="", flush=True)
-    print_live_resource_usage._last_line_length = len(line)
+    compact_line = (
+        f"[{stage}] {progress_percent:6.2f}% ({completed:,}/{total:,}) "
+        f"CPU:{cpu_label} RAM:{format_bytes(ram_bytes)}"
+    )
+    tiny_line = f"[{stage}] {progress_percent:6.2f}% ({completed:,}/{total:,})"
+
+    terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
+    max_width = max(20, terminal_width - 1)
+    line = full_line
+    if len(line) > max_width:
+        line = compact_line
+    if len(line) > max_width:
+        line = tiny_line
+    if len(line) > max_width:
+        line = line[:max_width]
+
+    # Use ANSI line clear to avoid leftovers when terminal width changes.
+    if sys.stdout.isatty():
+        sys.stdout.write("\r\033[2K")
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    else:
+        print(line)
+
+
+_BUILD_HEIGHT = 0
+_BUILD_WIDTH = 0
+_BUILD_FOV: tuple[float, float] = (0.0, 0.0)
+_BUILD_DECIMALS = 4
+
+_RENDER_SOURCE_IMAGE: np.ndarray | None = None
+_RENDER_ALPHA_LOOKUP: np.ndarray | None = None
+_RENDER_FINAL_ALPHA_LOOKUP: np.ndarray | None = None
+_RENDER_ALPHA_CRIT = 0.0
+_RENDER_FOV: tuple[float, float] = (0.0, 0.0)
+_RENDER_LOOP_AROUND = False
+
+
+def _init_build_alpha_worker(
+    height: int,
+    width: int,
+    fov: tuple[float, float],
+    decimals: int,
+) -> None:
+    """
+    Initialize build-alpha row workers.
+    """
+    global _BUILD_HEIGHT, _BUILD_WIDTH, _BUILD_FOV, _BUILD_DECIMALS
+    _BUILD_HEIGHT = int(height)
+    _BUILD_WIDTH = int(width)
+    _BUILD_FOV = fov
+    _BUILD_DECIMALS = int(decimals)
+
+
+def _build_alpha_row_worker(y: int) -> tuple[int, np.ndarray]:
+    """
+    Build one row of the alpha lookup table.
+    """
+    row = np.empty(_BUILD_WIDTH, dtype=np.float32)
+    for x in range(_BUILD_WIDTH):
+        alpha = round(pixel_to_angles((y, x), (_BUILD_HEIGHT, _BUILD_WIDTH), _BUILD_FOV)[0], _BUILD_DECIMALS)
+        row[x] = alpha
+    return int(y), row
+
+
+def _init_render_worker(
+    source_image: np.ndarray,
+    alpha_lookup: np.ndarray,
+    final_alpha_lookup: np.ndarray,
+    alpha_crit: float,
+    fov: tuple[float, float],
+    render_loop_around: bool,
+) -> None:
+    """
+    Initialize render row workers.
+    """
+    global _RENDER_SOURCE_IMAGE, _RENDER_ALPHA_LOOKUP, _RENDER_FINAL_ALPHA_LOOKUP
+    global _RENDER_ALPHA_CRIT, _RENDER_FOV, _RENDER_LOOP_AROUND
+    _RENDER_SOURCE_IMAGE = source_image
+    _RENDER_ALPHA_LOOKUP = alpha_lookup
+    _RENDER_FINAL_ALPHA_LOOKUP = final_alpha_lookup
+    _RENDER_ALPHA_CRIT = float(alpha_crit)
+    _RENDER_FOV = fov
+    _RENDER_LOOP_AROUND = bool(render_loop_around)
+
+
+def _render_row_worker(y: int) -> tuple[int, np.ndarray]:
+    """
+    Render one output row.
+    """
+    if _RENDER_SOURCE_IMAGE is None or _RENDER_ALPHA_LOOKUP is None or _RENDER_FINAL_ALPHA_LOOKUP is None:
+        raise RuntimeError("Render worker not initialized")
+
+    source_image = _RENDER_SOURCE_IMAGE
+    alpha_lookup = _RENDER_ALPHA_LOOKUP
+    final_alpha_lookup = _RENDER_FINAL_ALPHA_LOOKUP
+
+    height, width = source_image.shape[:2]
+    row = np.zeros_like(source_image[y])
+
+    if row.ndim == 1:
+        black: np.ndarray | float = 0.0
+        magenta: np.ndarray | float = 1.0
+    else:
+        channel_count = row.shape[-1]
+        black = np.zeros(channel_count, dtype=source_image.dtype)
+        magenta = np.zeros(channel_count, dtype=source_image.dtype)
+        if channel_count > 0:
+            magenta[0] = 1.0
+        if channel_count > 2:
+            magenta[2] = 1.0
+
+    for x in range(width):
+        alpha = alpha_lookup[y, x]
+        if alpha < _RENDER_ALPHA_CRIT:
+            row[x] = black
+            continue
+
+        final_alpha = final_alpha_lookup[y, x]
+        theta = pixel_to_angles((y, x), (height, width), _RENDER_FOV)[1]
+        final_pixel = angles_to_pixel((final_alpha, theta), source_image.shape[:2], _RENDER_FOV)
+
+        if not _RENDER_LOOP_AROUND:
+            if (
+                final_pixel[0] < 0
+                or final_pixel[0] >= source_image.shape[0]
+                or final_pixel[1] < 0
+                or final_pixel[1] >= source_image.shape[1]
+            ):
+                row[x] = magenta
+                continue
+        else:
+            final_pixel = (
+                final_pixel[0] % source_image.shape[0],
+                final_pixel[1] % source_image.shape[1],
+            )
+
+        row[x] = source_image[final_pixel]
+
+    return int(y), row
 
 def pixel_to_angles(
     pixel: tuple[int, int], 
@@ -361,7 +498,8 @@ def build_alpha_lookup(
     image_dimension: tuple[int, int],
     fov: tuple[float, float],
     decimals: int = 4,
-) -> np.ndarray:
+    num_worker: int = None, # type: ignore
+) -> tuple[np.ndarray, int, float]:
     """
     Build a per-pixel alpha lookup table with optional rounding.
 
@@ -371,15 +509,87 @@ def build_alpha_lookup(
         decimals (int): Decimal precision for alpha binning.
 
     Returns:
-        np.ndarray: Alpha lookup array with shape (height, width).
+        tuple[np.ndarray, int, float]:
+            (alpha lookup array, worker cores used, peak CPU cores used).
     """
     height, width = image_dimension
     alpha_lookup = np.empty((height, width), dtype=np.float32)
-    for y in range(height):
-        for x in range(width):
-            alpha = round(pixel_to_angles((y, x), (height, width), fov)[0], decimals)
-            alpha_lookup[y, x] = alpha
-    return alpha_lookup
+
+    tasks = list(range(height))
+    worker_cores_used = min(resolve_worker_count(num_worker), len(tasks))
+    total_rows = len(tasks)
+    completed_rows = 0
+    current_ram_bytes = get_current_ram_bytes()
+    current_cpu_cores: float | None = None
+    peak_cpu_cores = 0.0
+    logical_cores_available = int(os.cpu_count() or 1)
+
+    if not tasks:
+        return alpha_lookup, worker_cores_used, peak_cpu_cores
+
+    with ProcessPoolExecutor(
+        max_workers=worker_cores_used,
+        initializer=_init_build_alpha_worker,
+        initargs=(height, width, fov, decimals),
+    ) as executor:
+        futures = [executor.submit(_build_alpha_row_worker, y) for y in tasks]
+        worker_pids: set[int] = set()
+        total_futures = len(futures)
+        last_print_time = perf_counter()
+        live_print_interval_seconds = 0.25
+        last_cpu_sample_time = perf_counter()
+        last_cpu_ticks = get_total_cpu_ticks()
+
+        print_live_resource_usage(
+            "build_alpha_lookup",
+            completed_rows,
+            total_rows,
+            current_ram_bytes,
+            current_cpu_cores,
+            logical_cores_available,
+        )
+
+        for future in as_completed(futures):
+            processes = getattr(executor, "_processes", {})
+            if isinstance(processes, dict):
+                for process in processes.values():
+                    pid = getattr(process, "pid", None)
+                    if isinstance(pid, int):
+                        worker_pids.add(pid)
+
+            current_ram_bytes = get_total_ram_bytes(list(worker_pids))
+            current_total_cpu_ticks = get_total_cpu_ticks(list(worker_pids))
+            now = perf_counter()
+            if (
+                current_total_cpu_ticks is not None
+                and last_cpu_ticks is not None
+                and current_total_cpu_ticks >= last_cpu_ticks
+            ):
+                elapsed_seconds = max(now - last_cpu_sample_time, 1e-12)
+                delta_cpu_seconds = (current_total_cpu_ticks - last_cpu_ticks) / CLOCK_TICKS_PER_SECOND
+                current_cpu_cores = max(0.0, delta_cpu_seconds / elapsed_seconds)
+                peak_cpu_cores = max(peak_cpu_cores, current_cpu_cores)
+                last_cpu_ticks = current_total_cpu_ticks
+                last_cpu_sample_time = now
+
+            y, row = future.result()
+            alpha_lookup[y] = row
+            completed_rows += 1
+
+            if (now - last_print_time) >= live_print_interval_seconds or completed_rows == total_futures:
+                print_live_resource_usage(
+                    "build_alpha_lookup",
+                    completed_rows,
+                    total_rows,
+                    current_ram_bytes,
+                    current_cpu_cores,
+                    logical_cores_available,
+                )
+                last_print_time = now
+
+        print()
+
+    return alpha_lookup, worker_cores_used, peak_cpu_cores
 
 def _trace_single_alpha(args: tuple[np.intp, float, float]) -> tuple[np.intp, float]:
     """
@@ -526,6 +736,111 @@ def precompute_final_alpha_lookup(
     )
 
 
+def render_lensed_image(
+    source_image: np.ndarray,
+    alpha_lookup: np.ndarray,
+    final_alpha_lookup: np.ndarray,
+    alpha_crit: float,
+    fov: tuple[float, float],
+    render_loop_around: bool,
+    logical_cores_available: int,
+    num_worker: int = None, # type: ignore
+) -> tuple[np.ndarray, float, float, int]:
+    """
+    Render the final lensed image with live progress and resource reporting.
+
+    Returns:
+        tuple[np.ndarray, float, float, int]:
+            (rendered image, render time in seconds, peak CPU cores used, worker cores used).
+    """
+    height = source_image.shape[0]
+    lensed_image = np.zeros_like(source_image)
+    tasks = list(range(height))
+    worker_cores_used = min(resolve_worker_count(num_worker), len(tasks))
+
+    stage_start = perf_counter()
+    render_total_rows = len(tasks)
+    render_completed_rows = 0
+    render_current_ram_bytes = get_current_ram_bytes()
+    render_current_cpu_cores: float | None = None
+    render_peak_cpu_cores = 0.0
+
+    if not tasks:
+        return lensed_image, 0.0, render_peak_cpu_cores, worker_cores_used
+
+    with ProcessPoolExecutor(
+        max_workers=worker_cores_used,
+        initializer=_init_render_worker,
+        initargs=(
+            source_image,
+            alpha_lookup,
+            final_alpha_lookup,
+            alpha_crit,
+            fov,
+            render_loop_around,
+        ),
+    ) as executor:
+        futures = [executor.submit(_render_row_worker, y) for y in tasks]
+        worker_pids: set[int] = set()
+        total_futures = len(futures)
+        render_last_print_time = perf_counter()
+        render_print_interval_seconds = 0.25
+        render_last_cpu_sample_time = perf_counter()
+        render_last_cpu_ticks = get_total_cpu_ticks()
+
+        print_live_resource_usage(
+            "render",
+            render_completed_rows,
+            render_total_rows,
+            render_current_ram_bytes,
+            render_current_cpu_cores,
+            logical_cores_available,
+        )
+
+        for future in as_completed(futures):
+            processes = getattr(executor, "_processes", {})
+            if isinstance(processes, dict):
+                for process in processes.values():
+                    pid = getattr(process, "pid", None)
+                    if isinstance(pid, int):
+                        worker_pids.add(pid)
+
+            render_current_ram_bytes = get_total_ram_bytes(list(worker_pids))
+            current_total_cpu_ticks = get_total_cpu_ticks(list(worker_pids))
+            now = perf_counter()
+            if (
+                current_total_cpu_ticks is not None
+                and render_last_cpu_ticks is not None
+                and current_total_cpu_ticks >= render_last_cpu_ticks
+            ):
+                elapsed_seconds = max(now - render_last_cpu_sample_time, 1e-12)
+                delta_cpu_seconds = (current_total_cpu_ticks - render_last_cpu_ticks) / CLOCK_TICKS_PER_SECOND
+                render_current_cpu_cores = max(0.0, delta_cpu_seconds / elapsed_seconds)
+                render_peak_cpu_cores = max(render_peak_cpu_cores, render_current_cpu_cores)
+                render_last_cpu_ticks = current_total_cpu_ticks
+                render_last_cpu_sample_time = now
+
+            y, row = future.result()
+            lensed_image[y] = row
+            render_completed_rows += 1
+
+            if (now - render_last_print_time) >= render_print_interval_seconds or render_completed_rows == total_futures:
+                print_live_resource_usage(
+                    "render",
+                    render_completed_rows,
+                    render_total_rows,
+                    render_current_ram_bytes,
+                    render_current_cpu_cores,
+                    logical_cores_available,
+                )
+                render_last_print_time = now
+
+        print()
+
+    render_time_seconds = perf_counter() - stage_start
+    return lensed_image, render_time_seconds, render_peak_cpu_cores, worker_cores_used
+
+
 def print_benchmark_summary(
     image_dimension: tuple[int, int],
     alpha_crit: float,
@@ -586,9 +901,6 @@ def main():
     
     height, width = img.shape[:2]
     
-    # output image 
-    lensed_image = np.zeros_like(img)
-    
     # obesrver properties
     r_obs = 100.0 * M
     alpha_crit_arg = B_CRIT * np.sqrt(1 - R_S / r_obs) / r_obs
@@ -602,7 +914,7 @@ def main():
     render_loop_around: bool = False # poor naming, I don't really know how to call this variable. If True, when the ray lands outside the bounds of the background image, it will be tiled instead of being marked as out of bounds.
     
     stage_start = perf_counter()
-    alpha_lookup = build_alpha_lookup((height, width), fov)
+    alpha_lookup, build_worker_cores_used, build_peak_cpu_cores = build_alpha_lookup((height, width), fov)
     timings["build_alpha_lookup"] = perf_counter() - stage_start
 
     stage_start = perf_counter()
@@ -610,88 +922,23 @@ def main():
         final_alpha_lookup,
         unique_alpha_bins,
         traced_alpha_bins,
-        worker_cores_used,
+        precompute_worker_cores_used,
         precompute_current_ram_bytes,
         precompute_peak_ram_bytes,
         precompute_peak_cpu_cores,
     ) = precompute_final_alpha_lookup(alpha_lookup, alpha_crit, r_obs)
     timings["precompute_final_alpha"] = perf_counter() - stage_start
     
-    # render output image
-    black = np.array([0.0, 0.0, 0.0], dtype=lensed_image.dtype)
-    magenta = np.array([1.0, 0.0, 1.0], dtype=lensed_image.dtype)
-    stage_start = perf_counter()
-    render_total_rows = height
-    render_completed_rows = 0
-    render_current_ram_bytes = get_current_ram_bytes()
-    render_current_cpu_cores: float | None = None
-    render_peak_cpu_cores = 0.0
-    render_last_print_time = perf_counter()
-    render_print_interval_seconds = 0.25
-    render_last_cpu_sample_time = perf_counter()
-    render_last_cpu_ticks = get_total_cpu_ticks()
-    print_live_resource_usage(
-        "render",
-        render_completed_rows,
-        render_total_rows,
-        render_current_ram_bytes,
-        render_current_cpu_cores,
+    lensed_image, render_time_seconds, render_peak_cpu_cores, render_worker_cores_used = render_lensed_image(
+        img,
+        alpha_lookup,
+        final_alpha_lookup,
+        alpha_crit,
+        fov,
+        render_loop_around,
         logical_cores_available,
     )
-
-    for y in range(height):
-        for x in range(width):
-            alpha = alpha_lookup[y, x]
-            if alpha < alpha_crit:
-                lensed_image[y, x] = black
-                continue
-            
-            final_alpha = final_alpha_lookup[y, x]
-            theta = pixel_to_angles((y, x), (height, width), fov)[1]
-            final_pixel = angles_to_pixel((final_alpha, theta), img.shape[:2], fov)
-            
-            # for debugging purposes, returns a specific color if the ray escapes but goes out of bounds of the background image
-            if not render_loop_around:
-                if final_pixel[0] < 0 or final_pixel[0] >= img.shape[0] or final_pixel[1] < 0 or final_pixel[1] >= img.shape[1]:
-                    lensed_image[y, x] = magenta
-                    continue
-            else:
-                # Tile the background image when the ray lands outside bounds.
-                final_pixel = (
-                    final_pixel[0] % img.shape[0],
-                    final_pixel[1] % img.shape[1],
-                )
-            
-            color = img[final_pixel]
-            lensed_image[y, x] = color
-        render_completed_rows += 1
-        now = perf_counter()
-        if (now - render_last_print_time) >= render_print_interval_seconds or render_completed_rows == render_total_rows:
-            render_current_ram_bytes = get_current_ram_bytes()
-            current_cpu_ticks = get_total_cpu_ticks()
-            if (
-                current_cpu_ticks is not None
-                and render_last_cpu_ticks is not None
-                and current_cpu_ticks >= render_last_cpu_ticks
-            ):
-                elapsed_seconds = max(now - render_last_cpu_sample_time, 1e-12)
-                delta_cpu_seconds = (current_cpu_ticks - render_last_cpu_ticks) / CLOCK_TICKS_PER_SECOND
-                render_current_cpu_cores = max(0.0, delta_cpu_seconds / elapsed_seconds)
-                render_peak_cpu_cores = max(render_peak_cpu_cores, render_current_cpu_cores)
-                render_last_cpu_ticks = current_cpu_ticks
-                render_last_cpu_sample_time = now
-
-            print_live_resource_usage(
-                "render",
-                render_completed_rows,
-                render_total_rows,
-                render_current_ram_bytes,
-                render_current_cpu_cores,
-                logical_cores_available,
-            )
-            render_last_print_time = now
-    print()
-    timings["render"] = perf_counter() - stage_start
+    timings["render"] = render_time_seconds
     
     
     """
@@ -710,7 +957,12 @@ def main():
     timings["save_image"] = perf_counter() - stage_start
     timings["total"] = perf_counter() - total_start
 
-    peak_cores_used = max(worker_cores_used, 1, int(np.ceil(max(precompute_peak_cpu_cores, render_peak_cpu_cores))))
+    worker_cores_used = max(build_worker_cores_used, precompute_worker_cores_used, render_worker_cores_used)
+    peak_cores_used = max(
+        worker_cores_used,
+        1,
+        int(np.ceil(max(build_peak_cpu_cores, precompute_peak_cpu_cores, render_peak_cpu_cores))),
+    )
     core_metrics = {
         "logical_cores_available": logical_cores_available,
         "worker_cores_used": worker_cores_used,

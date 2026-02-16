@@ -4,8 +4,10 @@
 import numpy as np
 import matplotlib.image as mpimg
 from tqdm import tqdm
+import os
 from time import perf_counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Optional
 
 from geodesic_tracer import (
     M, R_S, R_PHOTON, B_CRIT,
@@ -161,10 +163,53 @@ def get_color_from_background(
     return background_image[final_pixel]
 
 
+def _resolve_worker_count(num_worker: int = None) -> int: # type: ignore
+    """
+    Resolve worker count from user input or system CPU count.
+    """
+    if num_worker is None:
+        return max(1, int(os.cpu_count() or 1))
+    return max(1, int(num_worker))
+
+
+_BUILD_HEIGHT = 0
+_BUILD_WIDTH = 0
+_BUILD_FOV: tuple[float, float] = (0.0, 0.0)
+_BUILD_DECIMALS = 4
+
+
+def _init_build_alpha_worker(
+    height: int,
+    width: int,
+    fov: tuple[float, float],
+    decimals: int,
+) -> None:
+    """
+    Initialize build-alpha row workers.
+    """
+    global _BUILD_HEIGHT, _BUILD_WIDTH, _BUILD_FOV, _BUILD_DECIMALS
+    _BUILD_HEIGHT = int(height)
+    _BUILD_WIDTH = int(width)
+    _BUILD_FOV = fov
+    _BUILD_DECIMALS = int(decimals)
+
+
+def _build_alpha_row_worker(y: int) -> tuple[int, np.ndarray]:
+    """
+    Build one row of the alpha lookup table.
+    """
+    row = np.empty(_BUILD_WIDTH, dtype=np.float32)
+    for x in range(_BUILD_WIDTH):
+        alpha = round(pixel_to_angles((y, x), (_BUILD_HEIGHT, _BUILD_WIDTH), _BUILD_FOV)[0], _BUILD_DECIMALS)
+        row[x] = alpha
+    return int(y), row
+
+
 def build_alpha_lookup(
     image_dimension: tuple[int, int],
     fov: tuple[float, float],
     decimals: int = 4,
+    num_worker: int = None, # type: ignore
 ) -> np.ndarray:
     """
     Build a per-pixel alpha lookup table with optional rounding.
@@ -173,16 +218,28 @@ def build_alpha_lookup(
         image_dimension (tuple[int, int]): Image dimension (height, width).
         fov (tuple[float, float]): Field of view in radians (horizontal, vertical).
         decimals (int): Decimal precision for alpha binning.
+        num_worker (int): Worker process count. Defaults to CPU core count.
 
     Returns:
         np.ndarray: Alpha lookup array with shape (height, width).
     """
     height, width = image_dimension
     alpha_lookup = np.empty((height, width), dtype=np.float32)
-    for y in range(height):
-        for x in range(width):
-            alpha = round(pixel_to_angles((y, x), (height, width), fov)[0], decimals)
-            alpha_lookup[y, x] = alpha
+    tasks = list(range(height))
+    if not tasks:
+        return alpha_lookup
+
+    worker_cores_used = min(_resolve_worker_count(num_worker), len(tasks))
+
+    with ProcessPoolExecutor(
+        max_workers=worker_cores_used,
+        initializer=_init_build_alpha_worker,
+        initargs=(height, width, fov, decimals),
+    ) as executor:
+        futures = [executor.submit(_build_alpha_row_worker, y) for y in tasks]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Building alpha lookup", unit="row"):
+            y, row = future.result()
+            alpha_lookup[y] = row
     return alpha_lookup
 
 def _trace_single_alpha(args: tuple[np.intp, float, float]) -> tuple[np.intp, float]:
@@ -245,6 +302,145 @@ def precompute_final_alpha_lookup(
     return final_alpha_lookup, int(unique_alpha.size), int(valid_indices.size)
 
 
+_RENDER_SOURCE_IMAGE: Optional[np.ndarray] = None
+_RENDER_ALPHA_LOOKUP: Optional[np.ndarray] = None
+_RENDER_FINAL_ALPHA_LOOKUP: Optional[np.ndarray] = None
+_RENDER_ALPHA_CRIT = 0.0
+_RENDER_FOV: tuple[float, float] = (0.0, 0.0)
+_RENDER_LOOP_AROUND = False
+
+
+def _init_render_worker(
+    source_image: np.ndarray,
+    alpha_lookup: np.ndarray,
+    final_alpha_lookup: np.ndarray,
+    alpha_crit: float,
+    fov: tuple[float, float],
+    render_loop_around: bool,
+) -> None:
+    """
+    Initialize render row workers.
+    """
+    global _RENDER_SOURCE_IMAGE, _RENDER_ALPHA_LOOKUP, _RENDER_FINAL_ALPHA_LOOKUP
+    global _RENDER_ALPHA_CRIT, _RENDER_FOV, _RENDER_LOOP_AROUND
+    _RENDER_SOURCE_IMAGE = source_image
+    _RENDER_ALPHA_LOOKUP = alpha_lookup
+    _RENDER_FINAL_ALPHA_LOOKUP = final_alpha_lookup
+    _RENDER_ALPHA_CRIT = float(alpha_crit)
+    _RENDER_FOV = fov
+    _RENDER_LOOP_AROUND = bool(render_loop_around)
+
+
+def _render_row_worker(y: int) -> tuple[int, np.ndarray]:
+    """
+    Render one output row.
+    """
+    if _RENDER_SOURCE_IMAGE is None or _RENDER_ALPHA_LOOKUP is None or _RENDER_FINAL_ALPHA_LOOKUP is None:
+        raise RuntimeError("Render worker not initialized")
+
+    source_image = _RENDER_SOURCE_IMAGE
+    alpha_lookup = _RENDER_ALPHA_LOOKUP
+    final_alpha_lookup = _RENDER_FINAL_ALPHA_LOOKUP
+
+    height, width = source_image.shape[:2]
+    row = np.zeros_like(source_image[y])
+
+    if row.ndim == 1:
+        black = 0.0
+        magenta = 1.0
+    else:
+        channel_count = row.shape[-1]
+        black = np.zeros(channel_count, dtype=source_image.dtype)
+        magenta = np.zeros(channel_count, dtype=source_image.dtype)
+        if channel_count > 0:
+            magenta[0] = 1.0
+        if channel_count > 2:
+            magenta[2] = 1.0
+
+    for x in range(width):
+        alpha = alpha_lookup[y, x]
+        if alpha < _RENDER_ALPHA_CRIT:
+            row[x] = black
+            continue
+
+        final_alpha = final_alpha_lookup[y, x]
+        theta = pixel_to_angles((y, x), (height, width), _RENDER_FOV)[1]
+        final_pixel = angles_to_pixel((final_alpha, theta), source_image.shape[:2], _RENDER_FOV)
+
+        # for debugging purposes, returns a specific color if the ray escapes but goes out of bounds of the background image
+        if not _RENDER_LOOP_AROUND:
+            if (
+                final_pixel[0] < 0
+                or final_pixel[0] >= source_image.shape[0]
+                or final_pixel[1] < 0
+                or final_pixel[1] >= source_image.shape[1]
+            ):
+                row[x] = magenta
+                continue
+        else:
+            # Tile the background image when the ray lands outside bounds.
+            final_pixel = (
+                final_pixel[0] % source_image.shape[0],
+                final_pixel[1] % source_image.shape[1],
+            )
+
+        row[x] = source_image[final_pixel]
+
+    return int(y), row
+
+
+def render_lensed_image(
+    source_image: np.ndarray,
+    alpha_lookup: np.ndarray,
+    final_alpha_lookup: np.ndarray,
+    alpha_crit: float,
+    fov: tuple[float, float],
+    render_loop_around: bool = False,
+    num_worker: int = None, # type: ignore
+) -> np.ndarray:
+    """
+    Render the output image using precomputed alpha lookup tables.
+
+    Args:
+        source_image (np.ndarray): Background/source image array.
+        alpha_lookup (np.ndarray): Per-pixel alpha lookup.
+        final_alpha_lookup (np.ndarray): Per-pixel final alpha lookup.
+        alpha_crit (float): Critical alpha threshold.
+        fov (tuple[float, float]): Field of view in radians (horizontal, vertical).
+        render_loop_around (bool): If True, tile out-of-bounds pixels.
+        num_worker (int): Worker process count. Defaults to CPU core count.
+
+    Returns:
+        np.ndarray: Rendered lensed image.
+    """
+    height = source_image.shape[0]
+    lensed_image = np.zeros_like(source_image)
+    tasks = list(range(height))
+    if not tasks:
+        return lensed_image
+
+    worker_cores_used = min(_resolve_worker_count(num_worker), len(tasks))
+
+    with ProcessPoolExecutor(
+        max_workers=worker_cores_used,
+        initializer=_init_render_worker,
+        initargs=(
+            source_image,
+            alpha_lookup,
+            final_alpha_lookup,
+            alpha_crit,
+            fov,
+            render_loop_around,
+        ),
+    ) as executor:
+        futures = [executor.submit(_render_row_worker, y) for y in tasks]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Rendering", unit="row"):
+            y, row = future.result()
+            lensed_image[y] = row
+
+    return lensed_image
+
+
 def print_benchmark_summary(
     image_dimension: tuple[int, int],
     alpha_crit: float,
@@ -293,9 +489,6 @@ def main():
     
     height, width = img.shape[:2]
     
-    # output image 
-    lensed_image = np.zeros_like(img)
-    
     # obesrver properties
     r_obs = 100.0 * M
     alpha_crit_arg = B_CRIT * np.sqrt(1 - R_S / r_obs) / r_obs
@@ -316,35 +509,15 @@ def main():
     final_alpha_lookup, unique_alpha_bins, traced_alpha_bins = precompute_final_alpha_lookup(alpha_lookup, alpha_crit, r_obs)
     timings["precompute_final_alpha"] = perf_counter() - stage_start
     
-    # render output image
-    black = np.array([0.0, 0.0, 0.0], dtype=lensed_image.dtype)
-    magenta = np.array([1.0, 0.0, 1.0], dtype=lensed_image.dtype)
     stage_start = perf_counter()
-    for y in tqdm(range(height), desc="Rendering", unit="row"):
-        for x in range(width):
-            alpha = alpha_lookup[y, x]
-            if alpha < alpha_crit:
-                lensed_image[y, x] = black
-                continue
-            
-            final_alpha = final_alpha_lookup[y, x]
-            theta = pixel_to_angles((y, x), (height, width), fov)[1]
-            final_pixel = angles_to_pixel((final_alpha, theta), img.shape[:2], fov)
-            
-            # for debugging purposes, returns a specific color if the ray escapes but goes out of bounds of the background image
-            if not render_loop_around:
-                if final_pixel[0] < 0 or final_pixel[0] >= img.shape[0] or final_pixel[1] < 0 or final_pixel[1] >= img.shape[1]:
-                    lensed_image[y, x] = magenta
-                    continue
-            else:
-                # Tile the background image when the ray lands outside bounds.
-                final_pixel = (
-                    final_pixel[0] % img.shape[0],
-                    final_pixel[1] % img.shape[1],
-                )
-            
-            color = img[final_pixel]
-            lensed_image[y, x] = color
+    lensed_image = render_lensed_image(
+        img,
+        alpha_lookup,
+        final_alpha_lookup,
+        alpha_crit,
+        fov,
+        render_loop_around,
+    )
     timings["render"] = perf_counter() - stage_start
     
     
