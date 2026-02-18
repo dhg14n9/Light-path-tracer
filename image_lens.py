@@ -91,30 +91,22 @@ def angles_to_pixel(
 
     return (py, px)
 
-def get_final_ray_angle(r_obs: float, alpha: float) -> float:
+def get_final_ray_angle(r_obs, alpha):
     """
-    This function takes in the initial angle alpha that the photon from the observer and returns the final angle after the photon escapes.
-    !!! THIS FUNCTION ASSUMES THAT THE PHOTON ESCAPES.
-
-    Args:
-        r_obs (float): Distance of the observer from the black hole center
-        alpha (float): Initial viewing angle
-
-    Returns:
-        float: Final angle after the photon escapes
+    Trace a ray and return (final_heading, phi_final).
+    Assumes the photon escapes.
     """
-    
     solution, _ = trace_ray(r_obs, alpha)
     r = solution.y[1] # type: ignore
     phi = solution.y[2] # type: ignore
-    
+
     x = r * np.cos(phi)
     y = r * np.sin(phi)
-    
+
     dx = x[-1] - x[-2]
     dy = y[-1] - y[-2]
 
-    return np.arctan2(dy, dx)
+    return np.arctan2(dy, dx), phi[-1]
 
 
 def world_heading_to_viewing_angle(world_heading: float) -> float:
@@ -151,8 +143,8 @@ def get_color_from_background(
     b = viewing_angle_to_impact_parameter(alpha, r_obs)
     if b < B_CRIT:
         return np.array([0.0, 0.0, 0.0])
-    
-    final_heading = get_final_ray_angle(r_obs, alpha)
+
+    final_heading, _ = get_final_ray_angle(r_obs, alpha)
     final_alpha = world_heading_to_viewing_angle(final_heading)
     final_pixel = angles_to_pixel((final_alpha, theta), background_image.shape[:2], fov)
     
@@ -242,20 +234,13 @@ def build_alpha_lookup(
             alpha_lookup[y] = row
     return alpha_lookup
 
-def _trace_single_alpha(args: tuple[np.intp, float, float]) -> tuple[np.intp, float]:
-    """
-    Helper function to trace a single alpha value.
-
-    Args:
-        args (tuple[np.intp, float, float]): (index, alpha, r_obs)
-
-    Returns:
-        tuple[np.intp, float]: (index, final_alpha)
-    """
+def _trace_single_alpha(args):
+    """Trace one alpha bin, return (index, final_alpha, n_half_orbits)."""
     idx, alpha, r_obs = args
-    final_heading = get_final_ray_angle(r_obs, alpha)
+    final_heading, phi_final = get_final_ray_angle(r_obs, alpha)
     final_alpha = world_heading_to_viewing_angle(final_heading)
-    return (idx, final_alpha)
+    n_half_orbits = int(abs(phi_final) // np.pi)
+    return (idx, final_alpha, n_half_orbits)
 
 def precompute_final_alpha_lookup(
     alpha_lookup: np.ndarray,
@@ -279,53 +264,62 @@ def precompute_final_alpha_lookup(
     valid_indices = np.flatnonzero(valid_unique_mask)
 
     final_alpha_for_unique = np.full(unique_alpha.shape, np.nan, dtype=np.float32)
-    
+    winding_for_unique = np.zeros(unique_alpha.shape, dtype=np.int16)
+
     tasks = [(idx, unique_alpha[idx], r_obs) for idx in valid_indices]
 
     if not tasks:
         final_alpha_lookup = final_alpha_for_unique[inverse_alpha_idx].reshape(alpha_lookup.shape)
-        return final_alpha_lookup, int(unique_alpha.size), int(valid_indices.size)
+        winding_lookup = winding_for_unique[inverse_alpha_idx].reshape(alpha_lookup.shape)
+        return final_alpha_lookup, winding_lookup, int(unique_alpha.size), int(valid_indices.size)
 
     with ProcessPoolExecutor(max_workers=num_worker) as executor:
         futures = [executor.submit(_trace_single_alpha, task) for task in tasks]
         for future in tqdm(as_completed(futures), total=len(futures), desc="Precomputing alpha lookup", unit="alpha"):
-            idx, final_alpha = future.result()
+            idx, final_alpha, n_half_orbits = future.result()
             final_alpha_for_unique[idx] = final_alpha
-            
-        
-    # for idx in tqdm(valid_indices, desc="Precomputing alpha lookup", unit="alpha"):
-    #     alpha = float(unique_alpha[idx])
-    #     final_heading = get_final_ray_angle(r_obs, alpha)
-    #     final_alpha_for_unique[idx] = world_heading_to_viewing_angle(final_heading)
+            winding_for_unique[idx] = n_half_orbits
 
     final_alpha_lookup = final_alpha_for_unique[inverse_alpha_idx].reshape(alpha_lookup.shape)
-    return final_alpha_lookup, int(unique_alpha.size), int(valid_indices.size)
+    winding_lookup = winding_for_unique[inverse_alpha_idx].reshape(alpha_lookup.shape)
+    return final_alpha_lookup, winding_lookup, int(unique_alpha.size), int(valid_indices.size)
 
+
+WINDING_COLORS = np.array([
+    [0.0, 0.2, 1.0],   # blue
+    [0.0, 0.7, 1.0],   # sky blue
+    [0.0, 1.0, 0.4],   # green
+    [1.0, 1.0, 0.0],   # yellow
+    [1.0, 0.4, 0.0],   # orange
+], dtype=np.float32)
 
 _RENDER_SOURCE_IMAGE: Optional[np.ndarray] = None
 _RENDER_ALPHA_LOOKUP: Optional[np.ndarray] = None
 _RENDER_FINAL_ALPHA_LOOKUP: Optional[np.ndarray] = None
+_RENDER_WINDING_LOOKUP: Optional[np.ndarray] = None
 _RENDER_ALPHA_CRIT = 0.0
 _RENDER_FOV: tuple[float, float] = (0.0, 0.0)
 _RENDER_LOOP_AROUND = False
 
 
 def _init_render_worker(
-    source_image: np.ndarray,
-    alpha_lookup: np.ndarray,
-    final_alpha_lookup: np.ndarray,
-    alpha_crit: float,
-    fov: tuple[float, float],
-    render_loop_around: bool,
-) -> None:
+    source_image,
+    alpha_lookup,
+    final_alpha_lookup,
+    winding_lookup,
+    alpha_crit,
+    fov,
+    render_loop_around,
+):
     """
     Initialize render row workers.
     """
     global _RENDER_SOURCE_IMAGE, _RENDER_ALPHA_LOOKUP, _RENDER_FINAL_ALPHA_LOOKUP
-    global _RENDER_ALPHA_CRIT, _RENDER_FOV, _RENDER_LOOP_AROUND
+    global _RENDER_WINDING_LOOKUP, _RENDER_ALPHA_CRIT, _RENDER_FOV, _RENDER_LOOP_AROUND
     _RENDER_SOURCE_IMAGE = source_image
     _RENDER_ALPHA_LOOKUP = alpha_lookup
     _RENDER_FINAL_ALPHA_LOOKUP = final_alpha_lookup
+    _RENDER_WINDING_LOOKUP = winding_lookup
     _RENDER_ALPHA_CRIT = float(alpha_crit)
     _RENDER_FOV = fov
     _RENDER_LOOP_AROUND = bool(render_loop_around)
@@ -341,6 +335,7 @@ def _render_row_worker(y: int) -> tuple[int, np.ndarray]:
     source_image = _RENDER_SOURCE_IMAGE
     alpha_lookup = _RENDER_ALPHA_LOOKUP
     final_alpha_lookup = _RENDER_FINAL_ALPHA_LOOKUP
+    winding_lookup = _RENDER_WINDING_LOOKUP
 
     height, width = source_image.shape[:2]
     row = np.zeros_like(source_image[y])
@@ -348,7 +343,6 @@ def _render_row_worker(y: int) -> tuple[int, np.ndarray]:
     if row.ndim == 1:
         black = 0.0
         magenta = 1.0
-        cyan = 1.0
     else:
         channel_count = row.shape[-1]
         black = np.zeros(channel_count, dtype=source_image.dtype)
@@ -357,11 +351,6 @@ def _render_row_worker(y: int) -> tuple[int, np.ndarray]:
             magenta[0] = 1.0
         if channel_count > 2:
             magenta[2] = 1.0
-        cyan = np.zeros(channel_count, dtype=source_image.dtype)
-        if channel_count > 1:
-            cyan[1] = 1.0
-        if channel_count > 2:
-            cyan[2] = 1.0
 
     for x in range(width):
         alpha = alpha_lookup[y, x]
@@ -371,7 +360,9 @@ def _render_row_worker(y: int) -> tuple[int, np.ndarray]:
 
         final_alpha = final_alpha_lookup[y, x]
         if final_alpha > np.pi / 2:
-            row[x] = cyan
+            n = winding_lookup[y, x] if winding_lookup is not None else 0
+            idx = min(n, len(WINDING_COLORS) - 1)
+            row[x] = WINDING_COLORS[idx]
             continue
         theta = pixel_to_angles((y, x), (height, width), _RENDER_FOV)[1]
         final_pixel = angles_to_pixel((final_alpha, theta), source_image.shape[:2], _RENDER_FOV)
@@ -399,28 +390,17 @@ def _render_row_worker(y: int) -> tuple[int, np.ndarray]:
 
 
 def render_lensed_image(
-    source_image: np.ndarray,
-    alpha_lookup: np.ndarray,
-    final_alpha_lookup: np.ndarray,
-    alpha_crit: float,
-    fov: tuple[float, float],
-    render_loop_around: bool = False,
-    num_worker: int = None, # type: ignore
-) -> np.ndarray:
+    source_image,
+    alpha_lookup,
+    final_alpha_lookup,
+    winding_lookup,
+    alpha_crit,
+    fov,
+    render_loop_around=False,
+    num_worker=None,
+):
     """
     Render the output image using precomputed alpha lookup tables.
-
-    Args:
-        source_image (np.ndarray): Background/source image array.
-        alpha_lookup (np.ndarray): Per-pixel alpha lookup.
-        final_alpha_lookup (np.ndarray): Per-pixel final alpha lookup.
-        alpha_crit (float): Critical alpha threshold.
-        fov (tuple[float, float]): Field of view in radians (horizontal, vertical).
-        render_loop_around (bool): If True, tile out-of-bounds pixels.
-        num_worker (int): Worker process count. Defaults to CPU core count.
-
-    Returns:
-        np.ndarray: Rendered lensed image.
     """
     height = source_image.shape[0]
     lensed_image = np.zeros_like(source_image)
@@ -437,6 +417,7 @@ def render_lensed_image(
             source_image,
             alpha_lookup,
             final_alpha_lookup,
+            winding_lookup,
             alpha_crit,
             fov,
             render_loop_around,
@@ -498,9 +479,13 @@ def load_lookup_cache(height, width, fov, decimals, r_obs, alpha_crit):
         expected = _cache_params(height, width, fov, decimals, r_obs, alpha_crit)
         if not np.allclose(data["params"], expected):
             return None
+        if "winding_lookup" not in data:
+            return None
+        winding = data["winding_lookup"]
         return (
             data["alpha_lookup"],
             data["final_alpha_lookup"],
+            winding,
             int(data["unique_alpha_bins"]),
             int(data["traced_alpha_bins"]),
         )
@@ -509,7 +494,8 @@ def load_lookup_cache(height, width, fov, decimals, r_obs, alpha_crit):
 
 
 def save_lookup_cache(
-    alpha_lookup, final_alpha_lookup, unique_alpha_bins, traced_alpha_bins,
+    alpha_lookup, final_alpha_lookup, winding_lookup,
+    unique_alpha_bins, traced_alpha_bins,
     height, width, fov, decimals, r_obs, alpha_crit,
 ):
     np.savez(
@@ -517,6 +503,7 @@ def save_lookup_cache(
         params=_cache_params(height, width, fov, decimals, r_obs, alpha_crit),
         alpha_lookup=alpha_lookup,
         final_alpha_lookup=final_alpha_lookup,
+        winding_lookup=winding_lookup,
         unique_alpha_bins=np.array(unique_alpha_bins),
         traced_alpha_bins=np.array(traced_alpha_bins),
     )
@@ -552,7 +539,7 @@ def main():
     decimals = 4
     cached = load_lookup_cache(height, width, fov, decimals, r_obs, alpha_crit)
     if cached is not None:
-        alpha_lookup, final_alpha_lookup, unique_alpha_bins, traced_alpha_bins = cached
+        alpha_lookup, final_alpha_lookup, winding_lookup, unique_alpha_bins, traced_alpha_bins = cached
         timings["build_alpha_lookup"] = 0.0
         timings["precompute_final_alpha"] = 0.0
         print("Loaded lookup tables from cache.")
@@ -562,11 +549,12 @@ def main():
         timings["build_alpha_lookup"] = perf_counter() - stage_start
 
         stage_start = perf_counter()
-        final_alpha_lookup, unique_alpha_bins, traced_alpha_bins = precompute_final_alpha_lookup(alpha_lookup, alpha_crit, r_obs)
+        final_alpha_lookup, winding_lookup, unique_alpha_bins, traced_alpha_bins = precompute_final_alpha_lookup(alpha_lookup, alpha_crit, r_obs)
         timings["precompute_final_alpha"] = perf_counter() - stage_start
 
         save_lookup_cache(
-            alpha_lookup, final_alpha_lookup, unique_alpha_bins, traced_alpha_bins,
+            alpha_lookup, final_alpha_lookup, winding_lookup,
+            unique_alpha_bins, traced_alpha_bins,
             height, width, fov, decimals, r_obs, alpha_crit,
         )
         print("Saved lookup tables to cache.")
@@ -576,6 +564,7 @@ def main():
         img,
         alpha_lookup,
         final_alpha_lookup,
+        winding_lookup,
         alpha_crit,
         fov,
         render_loop_around,
