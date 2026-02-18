@@ -7,11 +7,10 @@ from tqdm import tqdm
 import os
 from time import perf_counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Optional
 
 from geodesic_tracer import (
     M, R_S, R_PHOTON, B_CRIT,
-    trace_ray, viewing_angle_to_impact_parameter
+    trace_ray, trace_ray_orbit, viewing_angle_to_impact_parameter
 )
 
 def pixel_to_angles(
@@ -96,17 +95,10 @@ def get_final_ray_angle(r_obs, alpha):
     Trace a ray and return (final_heading, phi_final).
     Assumes the photon escapes.
     """
-    solution, _ = trace_ray(r_obs, alpha)
-    r = solution.y[1] # type: ignore
-    phi = solution.y[2] # type: ignore
-
-    x = r * np.cos(phi)
-    y = r * np.sin(phi)
-
-    dx = x[-1] - x[-2]
-    dy = y[-1] - y[-2]
-
-    return np.arctan2(dy, dx), phi[-1]
+    heading, phi_final, outcome = trace_ray_orbit(r_obs, alpha)
+    if outcome != 'escaped':
+        return np.nan, 0.0
+    return heading, phi_final
 
 
 def world_heading_to_viewing_angle(world_heading: float) -> float:
@@ -155,84 +147,19 @@ def get_color_from_background(
     return background_image[final_pixel]
 
 
-def _resolve_worker_count(num_worker: int = None) -> int: # type: ignore
-    """
-    Resolve worker count from user input or system CPU count.
-    """
-    if num_worker is None:
-        return max(1, int(os.cpu_count() or 1))
-    return max(1, int(num_worker))
-
-
-_BUILD_HEIGHT = 0
-_BUILD_WIDTH = 0
-_BUILD_FOV: tuple[float, float] = (0.0, 0.0)
-_BUILD_DECIMALS = 4
-
-
-def _init_build_alpha_worker(
-    height: int,
-    width: int,
-    fov: tuple[float, float],
-    decimals: int,
-) -> None:
-    """
-    Initialize build-alpha row workers.
-    """
-    global _BUILD_HEIGHT, _BUILD_WIDTH, _BUILD_FOV, _BUILD_DECIMALS
-    _BUILD_HEIGHT = int(height)
-    _BUILD_WIDTH = int(width)
-    _BUILD_FOV = fov
-    _BUILD_DECIMALS = int(decimals)
-
-
-def _build_alpha_row_worker(y: int) -> tuple[int, np.ndarray]:
-    """
-    Build one row of the alpha lookup table.
-    """
-    row = np.empty(_BUILD_WIDTH, dtype=np.float32)
-    for x in range(_BUILD_WIDTH):
-        alpha = round(pixel_to_angles((y, x), (_BUILD_HEIGHT, _BUILD_WIDTH), _BUILD_FOV)[0], _BUILD_DECIMALS)
-        row[x] = alpha
-    return int(y), row
-
-
-def build_alpha_lookup(
-    image_dimension: tuple[int, int],
-    fov: tuple[float, float],
-    decimals: int = 4,
-    num_worker: int = None, # type: ignore
-) -> np.ndarray:
-    """
-    Build a per-pixel alpha lookup table with optional rounding.
-
-    Args:
-        image_dimension (tuple[int, int]): Image dimension (height, width).
-        fov (tuple[float, float]): Field of view in radians (horizontal, vertical).
-        decimals (int): Decimal precision for alpha binning.
-        num_worker (int): Worker process count. Defaults to CPU core count.
-
-    Returns:
-        np.ndarray: Alpha lookup array with shape (height, width).
-    """
+def build_alpha_lookup(image_dimension, fov, decimals=4):
+    """Build a per-pixel alpha lookup table (vectorized)."""
     height, width = image_dimension
-    alpha_lookup = np.empty((height, width), dtype=np.float32)
-    tasks = list(range(height))
-    if not tasks:
-        return alpha_lookup
+    horizontal_fov, vertical_fov = fov
 
-    worker_cores_used = min(_resolve_worker_count(num_worker), len(tasks))
+    fx = (width / 2) / np.tan(horizontal_fov / 2)
+    fy = (height / 2) / np.tan(vertical_fov / 2)
 
-    with ProcessPoolExecutor(
-        max_workers=worker_cores_used,
-        initializer=_init_build_alpha_worker,
-        initargs=(height, width, fov, decimals),
-    ) as executor:
-        futures = [executor.submit(_build_alpha_row_worker, y) for y in tasks]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Building alpha lookup", unit="row"):
-            y, row = future.result()
-            alpha_lookup[y] = row
-    return alpha_lookup
+    x_cam = (np.arange(width) - width / 2) / fx
+    y_cam = (np.arange(height) - height / 2) / fy
+
+    alpha = np.arctan2(np.hypot(x_cam[None, :], y_cam[:, None]), 1.0)
+    return np.round(alpha, decimals).astype(np.float32)
 
 def _trace_single_alpha(args):
     """Trace one alpha bin, return (index, final_alpha, n_half_orbits)."""
@@ -257,7 +184,7 @@ def precompute_final_alpha_lookup(
         r_obs (float): Observer radius.
 
     Returns:
-        tuple[np.ndarray, int, int]: (final alpha lookup, unique alpha bins, traced alpha bins).
+        tuple: (final_alpha_lookup, winding_lookup, unique_alpha_bins, traced_alpha_bins).
     """
     unique_alpha, inverse_alpha_idx = np.unique(alpha_lookup, return_inverse=True)
     valid_unique_mask = unique_alpha >= alpha_crit
@@ -293,142 +220,74 @@ WINDING_COLORS = np.array([
     [1.0, 0.4, 0.0],   # orange
 ], dtype=np.float32)
 
-_RENDER_SOURCE_IMAGE: Optional[np.ndarray] = None
-_RENDER_ALPHA_LOOKUP: Optional[np.ndarray] = None
-_RENDER_FINAL_ALPHA_LOOKUP: Optional[np.ndarray] = None
-_RENDER_WINDING_LOOKUP: Optional[np.ndarray] = None
-_RENDER_ALPHA_CRIT = 0.0
-_RENDER_FOV: tuple[float, float] = (0.0, 0.0)
-_RENDER_LOOP_AROUND = False
-
-
-def _init_render_worker(
-    source_image,
-    alpha_lookup,
-    final_alpha_lookup,
-    winding_lookup,
-    alpha_crit,
-    fov,
-    render_loop_around,
-):
-    """
-    Initialize render row workers.
-    """
-    global _RENDER_SOURCE_IMAGE, _RENDER_ALPHA_LOOKUP, _RENDER_FINAL_ALPHA_LOOKUP
-    global _RENDER_WINDING_LOOKUP, _RENDER_ALPHA_CRIT, _RENDER_FOV, _RENDER_LOOP_AROUND
-    _RENDER_SOURCE_IMAGE = source_image
-    _RENDER_ALPHA_LOOKUP = alpha_lookup
-    _RENDER_FINAL_ALPHA_LOOKUP = final_alpha_lookup
-    _RENDER_WINDING_LOOKUP = winding_lookup
-    _RENDER_ALPHA_CRIT = float(alpha_crit)
-    _RENDER_FOV = fov
-    _RENDER_LOOP_AROUND = bool(render_loop_around)
-
-
-def _render_row_worker(y: int) -> tuple[int, np.ndarray]:
-    """
-    Render one output row.
-    """
-    if _RENDER_SOURCE_IMAGE is None or _RENDER_ALPHA_LOOKUP is None or _RENDER_FINAL_ALPHA_LOOKUP is None:
-        raise RuntimeError("Render worker not initialized")
-
-    source_image = _RENDER_SOURCE_IMAGE
-    alpha_lookup = _RENDER_ALPHA_LOOKUP
-    final_alpha_lookup = _RENDER_FINAL_ALPHA_LOOKUP
-    winding_lookup = _RENDER_WINDING_LOOKUP
-
+def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
+                        winding_lookup, alpha_crit, fov,
+                        render_loop_around=False):
+    """Render the output image using precomputed alpha lookup tables (vectorized)."""
     height, width = source_image.shape[:2]
-    row = np.zeros_like(source_image[y])
+    horizontal_fov, vertical_fov = fov
+    lensed = np.zeros_like(source_image)
 
-    if row.ndim == 1:
-        black = 0.0
-        magenta = 1.0
-    else:
-        channel_count = row.shape[-1]
-        black = np.zeros(channel_count, dtype=source_image.dtype)
-        magenta = np.zeros(channel_count, dtype=source_image.dtype)
-        if channel_count > 0:
-            magenta[0] = 1.0
-        if channel_count > 2:
-            magenta[2] = 1.0
+    # Vectorized theta lookup
+    fx = (width / 2) / np.tan(horizontal_fov / 2)
+    fy = (height / 2) / np.tan(vertical_fov / 2)
+    x_cam = (np.arange(width) - width / 2) / fx
+    y_cam = (np.arange(height) - height / 2) / fy
+    theta_lookup = np.arctan2(x_cam[None, :], y_cam[:, None])
 
-    for x in range(width):
-        alpha = alpha_lookup[y, x]
-        if alpha < _RENDER_ALPHA_CRIT:
-            row[x] = black
-            continue
+    valid = alpha_lookup >= alpha_crit
 
-        final_alpha = final_alpha_lookup[y, x]
-        if final_alpha > np.pi / 2:
-            n = winding_lookup[y, x] if winding_lookup is not None else 0
-            idx = min(n, len(WINDING_COLORS) - 1)
-            row[x] = WINDING_COLORS[idx]
-            continue
-        theta = pixel_to_angles((y, x), (height, width), _RENDER_FOV)[1]
-        final_pixel = angles_to_pixel((final_alpha, theta), source_image.shape[:2], _RENDER_FOV)
-
-        # for debugging purposes, returns a specific color if the ray escapes but goes out of bounds of the background image
-        if not _RENDER_LOOP_AROUND:
-            if (
-                final_pixel[0] < 0
-                or final_pixel[0] >= source_image.shape[0]
-                or final_pixel[1] < 0
-                or final_pixel[1] >= source_image.shape[1]
-            ):
-                row[x] = magenta
-                continue
+    # Winding: escaped rays that turned past pi/2
+    winding = valid & (final_alpha_lookup > np.pi / 2)
+    if np.any(winding):
+        if winding_lookup is not None:
+            idx = np.clip(winding_lookup[winding], 0, len(WINDING_COLORS) - 1)
         else:
-            # Tile the background image when the ray lands outside bounds.
-            final_pixel = (
-                final_pixel[0] % source_image.shape[0],
-                final_pixel[1] % source_image.shape[1],
-            )
+            idx = np.zeros(np.count_nonzero(winding), dtype=np.intp)
 
-        row[x] = source_image[final_pixel]
+        if source_image.ndim == 2:
+            luma = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+            lensed[winding] = (WINDING_COLORS @ luma)[idx]
+        else:
+            lensed[winding] = WINDING_COLORS[idx]
 
-    return int(y), row
+    # Escaped and within FOV
+    escaped = valid & ~np.isnan(final_alpha_lookup) & (final_alpha_lookup <= np.pi / 2)
+    n_escaped = np.count_nonzero(escaped)
 
+    if n_escaped > 0:
+        fa = final_alpha_lookup[escaped].astype(np.float64)
+        th = theta_lookup[escaped]
 
-def render_lensed_image(
-    source_image,
-    alpha_lookup,
-    final_alpha_lookup,
-    winding_lookup,
-    alpha_crit,
-    fov,
-    render_loop_around=False,
-    num_worker=None,
-):
-    """
-    Render the output image using precomputed alpha lookup tables.
-    """
-    height = source_image.shape[0]
-    lensed_image = np.zeros_like(source_image)
-    tasks = list(range(height))
-    if not tasks:
-        return lensed_image
+        r_cam = np.tan(fa)
+        src_x = np.rint(r_cam * np.sin(th) * fx + width / 2).astype(np.intp)
+        src_y = np.rint(r_cam * np.cos(th) * fy + height / 2).astype(np.intp)
 
-    worker_cores_used = min(_resolve_worker_count(num_worker), len(tasks))
+        if render_loop_around:
+            src_y %= height
+            src_x %= width
+            lensed[escaped] = source_image[src_y, src_x]
+        else:
+            in_bounds = ((src_y >= 0) & (src_y < height)
+                         & (src_x >= 0) & (src_x < width))
 
-    with ProcessPoolExecutor(
-        max_workers=worker_cores_used,
-        initializer=_init_render_worker,
-        initargs=(
-            source_image,
-            alpha_lookup,
-            final_alpha_lookup,
-            winding_lookup,
-            alpha_crit,
-            fov,
-            render_loop_around,
-        ),
-    ) as executor:
-        futures = [executor.submit(_render_row_worker, y) for y in tasks]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Rendering", unit="row"):
-            y, row = future.result()
-            lensed_image[y] = row
+            # Build per-escaped-pixel result: magenta default, source for in-bounds
+            if source_image.ndim == 3:
+                ch = source_image.shape[2]
+                magenta = np.zeros(ch, dtype=source_image.dtype)
+                magenta[0] = 1.0
+                if ch > 2:
+                    magenta[2] = 1.0
+            else:
+                magenta = source_image.dtype.type(1.0)
 
-    return lensed_image
+            result = np.empty(
+                (n_escaped,) + source_image.shape[2:], dtype=source_image.dtype)
+            result[:] = magenta
+            result[in_bounds] = source_image[src_y[in_bounds], src_x[in_bounds]]
+            lensed[escaped] = result
+
+    return lensed
 
 
 def print_benchmark_summary(

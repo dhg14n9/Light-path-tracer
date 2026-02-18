@@ -32,6 +32,84 @@ B_CRIT = 3 * np.sqrt(3) * M  # Critical impact parameter (~5.196 M)
 # Geodesic Equations
 # =============================================================================
 
+def orbit_equations(phi, state):
+    """
+    RHS for the Schwarzschild orbit equation d²u/dφ² + u = 3Mu².
+
+    State: [u, w] where u = 1/r, w = du/dφ.
+    """
+    u, w = state
+    du_dphi = w
+    dw_dphi = -u + 3 * M * u**2
+    return [du_dphi, dw_dphi]
+
+
+def trace_ray_orbit(r_obs, alpha, phi_max=50.0):
+    """
+    Trace a ray using the orbit equation. Returns (heading, phi_final, outcome).
+
+    Parameters
+    ----------
+    r_obs : observer radial coordinate
+    alpha : viewing angle in radians
+    phi_max : maximum azimuthal angle for integration
+    """
+    f0 = 1 - R_S / r_obs
+    b = r_obs * np.sin(alpha) / np.sqrt(f0)
+
+    u0 = 1.0 / r_obs
+    w0_sq = 1.0 / b**2 - u0**2 + 2 * M * u0**3
+    if w0_sq < 0:
+        return np.nan, 0.0, 'invalid'
+    # Positive w0: u increasing (ray moving inward) initially
+    w0 = np.sqrt(w0_sq)
+
+    # Event: captured (u exceeds 1/(R_S * 1.01))
+    def event_captured(phi, state):
+        return state[0] - 1.0 / (R_S * 1.01)
+    event_captured.terminal = True
+    event_captured.direction = 1
+
+    # Event: escaped (u drops below 1/(2 * r_obs))
+    def event_escaped(phi, state):
+        return state[0] - 1.0 / (2 * r_obs)
+    event_escaped.terminal = True
+    event_escaped.direction = -1
+
+    sol = solve_ivp(
+        orbit_equations,
+        [0, phi_max],
+        [u0, w0],
+        method='RK45',
+        events=[event_captured, event_escaped],
+        rtol=1e-10,
+        atol=1e-12,
+        max_step=0.05,
+    )
+
+    u_f = sol.y[0, -1]
+    w_f = sol.y[1, -1]
+    phi_f = sol.t[-1]
+    r_f = 1.0 / u_f
+
+    if r_f <= R_S * 1.1:
+        outcome = 'captured'
+    else:
+        outcome = 'escaped'
+
+    # Compute heading: dr/dphi = -w / u^2
+    dr_dphi = -w_f / u_f**2
+    # heading = arctan2(dy/dphi, dx/dphi) where x = r cos(phi), y = r sin(phi)
+    # dx/dphi = dr/dphi cos(phi) - r sin(phi)
+    # dy/dphi = dr/dphi sin(phi) + r cos(phi)
+    heading = np.arctan2(
+        dr_dphi * np.sin(phi_f) + r_f * np.cos(phi_f),
+        dr_dphi * np.cos(phi_f) - r_f * np.sin(phi_f),
+    )
+
+    return heading, phi_f, outcome
+
+
 def geodesic_equations(lambda_, state):
     """
     Equations of motion for null geodesics in Schwarzschild spacetime.
