@@ -348,6 +348,7 @@ def _render_row_worker(y: int) -> tuple[int, np.ndarray]:
     if row.ndim == 1:
         black = 0.0
         magenta = 1.0
+        cyan = 1.0
     else:
         channel_count = row.shape[-1]
         black = np.zeros(channel_count, dtype=source_image.dtype)
@@ -356,6 +357,11 @@ def _render_row_worker(y: int) -> tuple[int, np.ndarray]:
             magenta[0] = 1.0
         if channel_count > 2:
             magenta[2] = 1.0
+        cyan = np.zeros(channel_count, dtype=source_image.dtype)
+        if channel_count > 1:
+            cyan[1] = 1.0
+        if channel_count > 2:
+            cyan[2] = 1.0
 
     for x in range(width):
         alpha = alpha_lookup[y, x]
@@ -364,6 +370,9 @@ def _render_row_worker(y: int) -> tuple[int, np.ndarray]:
             continue
 
         final_alpha = final_alpha_lookup[y, x]
+        if final_alpha > np.pi / 2:
+            row[x] = cyan
+            continue
         theta = pixel_to_angles((y, x), (height, width), _RENDER_FOV)[1]
         final_pixel = angles_to_pixel((final_alpha, theta), source_image.shape[:2], _RENDER_FOV)
 
@@ -474,7 +483,46 @@ def print_benchmark_summary(
 
 
 
-def main(): 
+CACHE_FILE = "lookup_cache.npz"
+
+
+def _cache_params(height, width, fov, decimals, r_obs, alpha_crit):
+    return np.array([height, width, fov[0], fov[1], decimals, r_obs, alpha_crit])
+
+
+def load_lookup_cache(height, width, fov, decimals, r_obs, alpha_crit):
+    if not os.path.isfile(CACHE_FILE):
+        return None
+    try:
+        data = np.load(CACHE_FILE)
+        expected = _cache_params(height, width, fov, decimals, r_obs, alpha_crit)
+        if not np.allclose(data["params"], expected):
+            return None
+        return (
+            data["alpha_lookup"],
+            data["final_alpha_lookup"],
+            int(data["unique_alpha_bins"]),
+            int(data["traced_alpha_bins"]),
+        )
+    except Exception:
+        return None
+
+
+def save_lookup_cache(
+    alpha_lookup, final_alpha_lookup, unique_alpha_bins, traced_alpha_bins,
+    height, width, fov, decimals, r_obs, alpha_crit,
+):
+    np.savez(
+        CACHE_FILE,
+        params=_cache_params(height, width, fov, decimals, r_obs, alpha_crit),
+        alpha_lookup=alpha_lookup,
+        final_alpha_lookup=final_alpha_lookup,
+        unique_alpha_bins=np.array(unique_alpha_bins),
+        traced_alpha_bins=np.array(traced_alpha_bins),
+    )
+
+
+def main():
     debug_benchmark: bool = True
     timings: dict[str, float] = {}
     total_start = perf_counter()
@@ -501,13 +549,27 @@ def main():
     
     render_loop_around: bool = False # poor naming, I don't really know how to call this variable. If True, when the ray lands outside the bounds of the background image, it will be tiled instead of being marked as out of bounds.
     
-    stage_start = perf_counter()
-    alpha_lookup = build_alpha_lookup((height, width), fov)
-    timings["build_alpha_lookup"] = perf_counter() - stage_start
+    decimals = 4
+    cached = load_lookup_cache(height, width, fov, decimals, r_obs, alpha_crit)
+    if cached is not None:
+        alpha_lookup, final_alpha_lookup, unique_alpha_bins, traced_alpha_bins = cached
+        timings["build_alpha_lookup"] = 0.0
+        timings["precompute_final_alpha"] = 0.0
+        print("Loaded lookup tables from cache.")
+    else:
+        stage_start = perf_counter()
+        alpha_lookup = build_alpha_lookup((height, width), fov, decimals=decimals)
+        timings["build_alpha_lookup"] = perf_counter() - stage_start
 
-    stage_start = perf_counter()
-    final_alpha_lookup, unique_alpha_bins, traced_alpha_bins = precompute_final_alpha_lookup(alpha_lookup, alpha_crit, r_obs)
-    timings["precompute_final_alpha"] = perf_counter() - stage_start
+        stage_start = perf_counter()
+        final_alpha_lookup, unique_alpha_bins, traced_alpha_bins = precompute_final_alpha_lookup(alpha_lookup, alpha_crit, r_obs)
+        timings["precompute_final_alpha"] = perf_counter() - stage_start
+
+        save_lookup_cache(
+            alpha_lookup, final_alpha_lookup, unique_alpha_bins, traced_alpha_bins,
+            height, width, fov, decimals, r_obs, alpha_crit,
+        )
+        print("Saved lookup tables to cache.")
     
     stage_start = perf_counter()
     lensed_image = render_lensed_image(
