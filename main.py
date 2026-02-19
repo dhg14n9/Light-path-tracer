@@ -1,49 +1,49 @@
 """
-Example script demonstrating geodesic tracing around a Schwarzschild black hole.
+Example script demonstrating geodesic tracing around a black hole.
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 
-from geodesic_tracer import (
-    M, R_S, R_PHOTON, B_CRIT,
-    trace_ray, viewing_angle_to_impact_parameter
-)
+from metrics import Schwarzschild
+from geodesic_tracer import trace_ray
 
 
-def main():
-    # Observer position
-    r_obs = 50.0 * M
+def main(metric=None):
+    if metric is None:
+        metric = Schwarzschild(M=1.0)
 
-    # Choose a viewing angle (in degrees)
+    r_obs = 50.0 * metric.M
+
     alpha_deg = 8.0
     alpha = np.radians(alpha_deg)
 
-    # Trace the ray
-    solution, outcome = trace_ray(r_obs, alpha)
+    solution, outcome = trace_ray(metric, r_obs, alpha)
 
-    # Print results
-    b = viewing_angle_to_impact_parameter(alpha, r_obs)
+    b = metric.viewing_angle_to_impact_parameter(alpha, r_obs)
+    print(f"Metric:             {type(metric).__name__}")
     print(f"Observer radius:    r_obs = {r_obs} M")
     print(f"Viewing angle:      α = {alpha_deg}°")
     print(f"Impact parameter:   b = {b:.4f} M")
-    print(f"Critical b:         b_crit = {B_CRIT:.4f} M")
     print(f"Outcome:            {outcome.upper()}")
 
-    # Extract trajectory
-    r = solution.y[1] # type: ignore
-    phi = solution.y[2] #type: ignore
+    r = solution.y[1]
+    phi = solution.y[3]  # 8D: phi at index 3
     x = r * np.cos(phi)
     y = r * np.sin(phi)
 
-    # Plot
     fig, ax = plt.subplots(figsize=(10, 10))
 
     # Black hole
     theta = np.linspace(0, 2 * np.pi, 200)
-    ax.fill(R_S * np.cos(theta), R_S * np.sin(theta), 'k', label='Event horizon')
-    ax.plot(R_PHOTON * np.cos(theta), R_PHOTON * np.sin(theta),
-            'r--', linewidth=1.5, label='Photon sphere')
+    r_horizon = metric.capture_radius()
+    ax.fill(r_horizon * np.cos(theta), r_horizon * np.sin(theta),
+            'k', label='Event horizon')
+
+    if hasattr(metric, 'R_PHOTON'):
+        r_ph = metric.R_PHOTON
+        ax.plot(r_ph * np.cos(theta), r_ph * np.sin(theta),
+                'r--', linewidth=1.5, label='Photon sphere')
 
     # Trajectory
     color = 'steelblue' if outcome == 'escaped' else 'crimson'
@@ -52,12 +52,12 @@ def main():
     # Observer
     ax.plot(r_obs, 0, 'go', markersize=12, label='Observer')
 
-    # Formatting
     ax.set_xlabel('x / M', fontsize=12)
     ax.set_ylabel('y / M', fontsize=12)
-    ax.set_title(f'Geodesic trajectory (α = {alpha_deg}°, b = {b:.2f} M)', fontsize=14)
+    ax.set_title(
+        f'{type(metric).__name__} geodesic (α = {alpha_deg}°, b = {b:.2f} M)',
+        fontsize=14)
 
-    # Set symmetric axis limits centered on the black hole
     limit = r_obs * 1.1
     ax.set_xlim(-limit, limit)
     ax.set_ylim(-limit, limit)

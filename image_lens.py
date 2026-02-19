@@ -8,28 +8,14 @@ import os
 from time import perf_counter
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-from geodesic_tracer import (
-    M, R_S, R_PHOTON, B_CRIT,
-    trace_ray, trace_ray_orbit, viewing_angle_to_impact_parameter
-)
+from metrics import Schwarzschild, Kerr
 
-def pixel_to_angles(
-    pixel: tuple[int, int], 
-    image_dimension: tuple[int, int], 
-    fov: tuple[float, float]
-) -> tuple[float, float]:
-    """
-    This function takes in the pixel coordinates, the image dimensions, and fov and
-    returns the corresponding angles (alpha, theta) for the given pixel.
-    
-    Args:
-        pixel (tuple[int, int]): The coordinate of the pixel in the image
-        image_dimension (tuple[int, int]): Dimension of the image (height, width)
-        fov (tuple[float, float]): Field of view in radians (horizontal, vertical)
 
-    Returns:
-        tuple[float, float]: The corresponding angles (alpha, theta) for the given pixel
-    """
+# ============================================================================
+# Pixel <-> angle conversions
+# ============================================================================
+
+def pixel_to_angles(pixel, image_dimension, fov):
     height, width = image_dimension
     horizontal_fov, vertical_fov = fov
 
@@ -47,24 +33,7 @@ def pixel_to_angles(
     return (alpha, theta)
 
 
-def angles_to_pixel(
-    angles: tuple[float, float], 
-    image_dimension: tuple[int, int], 
-    fov: tuple[float, float], 
-    clip: bool = False
-) -> tuple[int, int]:
-    """
-    Inverse of ``pixel_to_angles``: convert (alpha, theta) back to pixel (y, x).
-
-    Args:
-        angles (tuple[float, float]): (alpha, theta) in radians.
-        image_dimension (tuple[int, int]): Image dimension (height, width).
-        fov (tuple[float, float]): Field of view in radians (horizontal, vertical).
-        clip (bool): Clamp output pixel to image bounds if True.
-
-    Returns:
-        tuple[int, int]: Pixel coordinate (y, x).
-    """
+def angles_to_pixel(angles, image_dimension, fov, clip=False):
     alpha, theta = angles
     height, width = image_dimension
     horizontal_fov, vertical_fov = fov
@@ -83,69 +52,15 @@ def angles_to_pixel(
     py = int(np.rint(y + height / 2))
 
     if clip:
-        # TODO: This clipping is not yet perfect (I think)
         px = int(np.clip(px, 0, width - 1))
         py = int(np.clip(py, 0, height - 1))
-        pass
 
     return (py, px)
 
-def get_final_ray_angle(r_obs, alpha):
-    """
-    Trace a ray and return (final_heading, phi_final).
-    Assumes the photon escapes.
-    """
-    heading, phi_final, outcome = trace_ray_orbit(r_obs, alpha)
-    if outcome != 'escaped':
-        return np.nan, 0.0
-    return heading, phi_final
 
-
-def world_heading_to_viewing_angle(world_heading: float) -> float:
-    """
-    Convert a world-space heading angle (from +x axis) to camera viewing angle
-    from the forward axis (-x toward the black hole center).
-    Essentially fix stuff
-    """
-    return np.arccos(np.clip(-np.cos(world_heading), -1.0, 1.0))
-
-
-
-#! As I implement the alpha first look up table, this function will become obsolete
-def get_color_from_background(
-    angles: tuple[float, float], 
-    background_image: np.ndarray, 
-    fov: tuple[float, float], 
-    r_obs: float
-) -> np.ndarray:
-    """
-    This function takes in the final angles (alpha, theta) of the photon after escaping and returns the corresponding color from the background image.
-
-    Args:
-        angles (tuple[float, float]): (alpha, theta) in radians (initial angles from the observer).
-        background_image (np.ndarray): Background image array.
-        fov (tuple[float, float]): Field of view in radians (horizontal, vertical).
-
-    Returns:
-        np.ndarray: Color of the pixel in the background image corresponding to the given angles.
-    """
-    
-    # check if the rays will actually escape the black hole
-    alpha, theta = angles
-    b = viewing_angle_to_impact_parameter(alpha, r_obs)
-    if b < B_CRIT:
-        return np.array([0.0, 0.0, 0.0])
-
-    final_heading, _ = get_final_ray_angle(r_obs, alpha)
-    final_alpha = world_heading_to_viewing_angle(final_heading)
-    final_pixel = angles_to_pixel((final_alpha, theta), background_image.shape[:2], fov)
-    
-    # for debugging purposes, returns a specific color if the ray escapes but goes out of bounds of the background image
-    if final_pixel[0] < 0 or final_pixel[0] >= background_image.shape[0] or final_pixel[1] < 0 or final_pixel[1] >= background_image.shape[1]:
-        return np.array([1.0, 0.0, 1.0])
-    
-    return background_image[final_pixel]
-
+# ============================================================================
+# Alpha lookup (1D, for spherically symmetric metrics)
+# ============================================================================
 
 def build_alpha_lookup(image_dimension, fov, decimals=4):
     """Build a per-pixel alpha lookup table (vectorized)."""
@@ -161,56 +76,183 @@ def build_alpha_lookup(image_dimension, fov, decimals=4):
     alpha = np.arctan2(np.hypot(x_cam[None, :], y_cam[:, None]), 1.0)
     return np.round(alpha, decimals).astype(np.float32)
 
+
+# Global reference to metric for multiprocessing workers
+_worker_metric = None
+
+
+def _init_worker(metric_cls_name, metric_kwargs):
+    """Initialize the metric in each worker process."""
+    global _worker_metric
+    from metrics import Schwarzschild, Kerr
+    cls = {'Schwarzschild': Schwarzschild, 'Kerr': Kerr}[metric_cls_name]
+    _worker_metric = cls(**metric_kwargs)
+
+
 def _trace_single_alpha(args):
-    """Trace one alpha bin, return (index, final_alpha, n_half_orbits)."""
+    """Trace one alpha bin (1D, spherically symmetric)."""
     idx, alpha, r_obs = args
-    final_heading, phi_final = get_final_ray_angle(r_obs, alpha)
-    final_alpha = world_heading_to_viewing_angle(final_heading)
-    n_half_orbits = int(abs(phi_final) // np.pi)
+    final_alpha, n_half_orbits, outcome = _worker_metric.trace_ray(
+        r_obs, alpha)
+    if outcome != 'escaped':
+        return (idx, np.nan, 0)
     return (idx, final_alpha, n_half_orbits)
 
+
+def _trace_single_alpha_theta(args):
+    """Trace one (alpha, theta) bin (2D, for non-spherically symmetric)."""
+    idx, alpha, screen_theta, r_obs, theta_obs = args
+    final_alpha, n_half_orbits, outcome = _worker_metric.trace_ray(
+        r_obs, alpha, theta=screen_theta, theta_obs=theta_obs)
+    if outcome != 'escaped':
+        return (idx, np.nan, 0)
+    return (idx, final_alpha, n_half_orbits)
+
+
 def precompute_final_alpha_lookup(
-    alpha_lookup: np.ndarray,
-    alpha_crit: float,
-    r_obs: float,
-    num_worker: int = None, # type: ignore
-) -> tuple[np.ndarray, int, int]:
-    """
-    Precompute per-pixel final alpha by tracing only unique alpha bins that can escape.
+    alpha_lookup, alpha_crit, r_obs, metric,
+    num_worker=None,
+):
+    """Precompute per-pixel final alpha by tracing unique alpha bins (1D).
 
-    Args:
-        alpha_lookup (np.ndarray): Per-pixel alpha array.
-        alpha_crit (float): Critical angle in radians.
-        r_obs (float): Observer radius.
-
-    Returns:
-        tuple: (final_alpha_lookup, winding_lookup, unique_alpha_bins, traced_alpha_bins).
+    For spherically symmetric metrics only.
     """
-    unique_alpha, inverse_alpha_idx = np.unique(alpha_lookup, return_inverse=True)
+    unique_alpha, inverse_alpha_idx = np.unique(
+        alpha_lookup, return_inverse=True)
     valid_unique_mask = unique_alpha >= alpha_crit
     valid_indices = np.flatnonzero(valid_unique_mask)
 
-    final_alpha_for_unique = np.full(unique_alpha.shape, np.nan, dtype=np.float32)
+    final_alpha_for_unique = np.full(unique_alpha.shape, np.nan,
+                                     dtype=np.float32)
     winding_for_unique = np.zeros(unique_alpha.shape, dtype=np.int16)
 
     tasks = [(idx, unique_alpha[idx], r_obs) for idx in valid_indices]
 
     if not tasks:
-        final_alpha_lookup = final_alpha_for_unique[inverse_alpha_idx].reshape(alpha_lookup.shape)
-        winding_lookup = winding_for_unique[inverse_alpha_idx].reshape(alpha_lookup.shape)
-        return final_alpha_lookup, winding_lookup, int(unique_alpha.size), int(valid_indices.size)
+        flat = inverse_alpha_idx.reshape(alpha_lookup.shape)
+        return (final_alpha_for_unique[flat],
+                winding_for_unique[flat],
+                int(unique_alpha.size), int(valid_indices.size))
 
-    with ProcessPoolExecutor(max_workers=num_worker) as executor:
-        futures = [executor.submit(_trace_single_alpha, task) for task in tasks]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Precomputing alpha lookup", unit="alpha"):
+    metric_kwargs = {'M': metric.M}
+    if hasattr(metric, 'a'):
+        metric_kwargs['a'] = metric.a
+
+    with ProcessPoolExecutor(
+        max_workers=num_worker,
+        initializer=_init_worker,
+        initargs=(type(metric).__name__, metric_kwargs),
+    ) as executor:
+        futures = [executor.submit(_trace_single_alpha, task)
+                   for task in tasks]
+        for future in tqdm(as_completed(futures), total=len(futures),
+                           desc="Precomputing alpha lookup", unit="alpha"):
             idx, final_alpha, n_half_orbits = future.result()
             final_alpha_for_unique[idx] = final_alpha
             winding_for_unique[idx] = n_half_orbits
 
-    final_alpha_lookup = final_alpha_for_unique[inverse_alpha_idx].reshape(alpha_lookup.shape)
-    winding_lookup = winding_for_unique[inverse_alpha_idx].reshape(alpha_lookup.shape)
-    return final_alpha_lookup, winding_lookup, int(unique_alpha.size), int(valid_indices.size)
+    flat = inverse_alpha_idx.reshape(alpha_lookup.shape)
+    return (final_alpha_for_unique[flat],
+            winding_for_unique[flat],
+            int(unique_alpha.size), int(valid_indices.size))
 
+
+# ============================================================================
+# Alpha+theta lookup (2D, for non-spherically-symmetric metrics like Kerr)
+# ============================================================================
+
+def precompute_final_alpha_lookup_2d(
+    alpha_lookup, fov, alpha_crit, r_obs, metric,
+    n_theta_bins=32, theta_obs=np.pi / 2, num_worker=None,
+):
+    """Precompute per-pixel final alpha for non-spherically-symmetric metrics.
+
+    Uses unique alpha bins (same as 1D) × coarse theta bins.
+    Reflection symmetry theta -> -theta halves the work for equatorial
+    observers.
+    """
+    shape = alpha_lookup.shape
+    height, width = shape
+
+    # Unique alphas (same strategy as 1D)
+    unique_alpha, inv_alpha = np.unique(alpha_lookup, return_inverse=True)
+    inv_alpha = inv_alpha.reshape(shape)
+    n_alpha = len(unique_alpha)
+
+    # Per-pixel screen theta
+    hfov, vfov = fov
+    fx = (width / 2) / np.tan(hfov / 2)
+    fy = (height / 2) / np.tan(vfov / 2)
+    x_cam = (np.arange(width) - width / 2) / fx
+    y_cam = (np.arange(height) - height / 2) / fy
+    theta_pixel = np.arctan2(x_cam[None, :], y_cam[:, None])
+
+    # Theta binning (|theta| symmetry for equatorial observer)
+    use_symmetry = np.isclose(theta_obs, np.pi / 2)
+    if use_symmetry:
+        theta_for_bin = np.abs(theta_pixel)
+        theta_edges = np.linspace(0, np.pi, n_theta_bins + 1)
+    else:
+        theta_for_bin = theta_pixel
+        theta_edges = np.linspace(-np.pi, np.pi, n_theta_bins + 1)
+
+    theta_bin_idx = np.clip(
+        np.digitize(theta_for_bin, theta_edges) - 1,
+        0, n_theta_bins - 1)
+    theta_centers = 0.5 * (theta_edges[:-1] + theta_edges[1:])
+
+    # Valid alpha mask
+    valid_alpha_mask = unique_alpha >= alpha_crit
+    valid_alpha_indices = np.flatnonzero(valid_alpha_mask)
+
+    # Result grid: (n_alpha, n_theta_bins)
+    final_alpha_grid = np.full(
+        (n_alpha, n_theta_bins), np.nan, dtype=np.float32)
+    winding_grid = np.zeros((n_alpha, n_theta_bins), dtype=np.int16)
+
+    # Build tasks for valid (alpha, theta_bin) pairs
+    tasks = []
+    for ai in valid_alpha_indices:
+        for ti in range(n_theta_bins):
+            grid_idx = int(ai) * n_theta_bins + ti
+            tasks.append((grid_idx, float(unique_alpha[ai]),
+                          float(theta_centers[ti]), r_obs, theta_obs))
+
+    n_grid = n_alpha * n_theta_bins
+    print(f"  {n_alpha} unique alphas x {n_theta_bins} theta bins "
+          f"= {n_grid:,} grid points, {len(tasks):,} to trace")
+
+    if tasks:
+        metric_kwargs = {'M': metric.M}
+        if hasattr(metric, 'a'):
+            metric_kwargs['a'] = metric.a
+
+        with ProcessPoolExecutor(
+            max_workers=num_worker,
+            initializer=_init_worker,
+            initargs=(type(metric).__name__, metric_kwargs),
+        ) as executor:
+            futures = [executor.submit(_trace_single_alpha_theta, task)
+                       for task in tasks]
+            for future in tqdm(
+                as_completed(futures), total=len(futures),
+                desc="Tracing rays", unit="ray",
+            ):
+                grid_idx, final_alpha, n_half_orbits = future.result()
+                ai = grid_idx // n_theta_bins
+                ti = grid_idx % n_theta_bins
+                final_alpha_grid[ai, ti] = final_alpha
+                winding_grid[ai, ti] = n_half_orbits
+
+    # Map grid → pixels
+    final_alpha_out = final_alpha_grid[inv_alpha, theta_bin_idx]
+    winding_out = winding_grid[inv_alpha, theta_bin_idx]
+    return (final_alpha_out, winding_out, n_grid, len(tasks))
+
+
+# ============================================================================
+# Rendering
+# ============================================================================
 
 WINDING_COLORS = np.array([
     [0.0, 0.2, 1.0],   # blue
@@ -220,15 +262,15 @@ WINDING_COLORS = np.array([
     [1.0, 0.4, 0.0],   # orange
 ], dtype=np.float32)
 
+
 def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
                         winding_lookup, alpha_crit, fov,
                         render_loop_around=False):
-    """Render the output image using precomputed alpha lookup tables (vectorized)."""
+    """Render the output image using precomputed alpha lookup tables."""
     height, width = source_image.shape[:2]
     horizontal_fov, vertical_fov = fov
     lensed = np.zeros_like(source_image)
 
-    # Vectorized theta lookup
     fx = (width / 2) / np.tan(horizontal_fov / 2)
     fy = (height / 2) / np.tan(vertical_fov / 2)
     x_cam = (np.arange(width) - width / 2) / fx
@@ -252,7 +294,8 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
             lensed[winding] = WINDING_COLORS[idx]
 
     # Escaped and within FOV
-    escaped = valid & ~np.isnan(final_alpha_lookup) & (final_alpha_lookup <= np.pi / 2)
+    escaped = valid & ~np.isnan(final_alpha_lookup) & (
+        final_alpha_lookup <= np.pi / 2)
     n_escaped = np.count_nonzero(escaped)
 
     if n_escaped > 0:
@@ -271,7 +314,6 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
             in_bounds = ((src_y >= 0) & (src_y < height)
                          & (src_x >= 0) & (src_x < width))
 
-            # Build per-escaped-pixel result: magenta default, source for in-bounds
             if source_image.ndim == 3:
                 ch = source_image.shape[2]
                 magenta = np.zeros(ch, dtype=source_image.dtype)
@@ -282,7 +324,8 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
                 magenta = source_image.dtype.type(1.0)
 
             result = np.empty(
-                (n_escaped,) + source_image.shape[2:], dtype=source_image.dtype)
+                (n_escaped,) + source_image.shape[2:],
+                dtype=source_image.dtype)
             result[:] = magenta
             result[in_bounds] = source_image[src_y[in_bounds], src_x[in_bounds]]
             lensed[escaped] = result
@@ -290,16 +333,12 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
     return lensed
 
 
-def print_benchmark_summary(
-    image_dimension: tuple[int, int],
-    alpha_crit: float,
-    unique_alpha_bins: int,
-    traced_alpha_bins: int,
-    timings: dict[str, float],
-) -> None:
-    """
-    Print a compact benchmark summary for the current render.
-    """
+# ============================================================================
+# Benchmark
+# ============================================================================
+
+def print_benchmark_summary(image_dimension, alpha_crit, unique_bins,
+                            traced_bins, timings):
     height, width = image_dimension
     pixel_count = width * height
     render_time = max(timings.get("render", 0.0), 1e-12)
@@ -308,140 +347,182 @@ def print_benchmark_summary(
     print("\nBenchmark summary")
     print(f"  resolution: {width}x{height} ({pixel_count:,} pixels)")
     print(f"  alpha_crit: {alpha_crit:.6f} rad")
-    print(f"  unique alpha bins: {unique_alpha_bins:,}")
-    print(f"  traced alpha bins: {traced_alpha_bins:,}")
+    print(f"  unique bins: {unique_bins:,}")
+    print(f"  traced bins: {traced_bins:,}")
     print(f"  {'load_image':<26}{timings.get('load_image', 0.0):>10.3f} s")
-    print(f"  {'build_alpha_lookup':<26}{timings.get('build_alpha_lookup', 0.0):>10.3f} s")
-    print(f"  {'precompute_final_alpha':<26}{timings.get('precompute_final_alpha', 0.0):>10.3f} s")
+    print(f"  {'build_lookup':<26}{timings.get('build_lookup', 0.0):>10.3f} s")
+    print(f"  {'precompute':<26}{timings.get('precompute', 0.0):>10.3f} s")
     print(f"  {'render':<26}{timings.get('render', 0.0):>10.3f} s")
     print(f"  {'save_image':<26}{timings.get('save_image', 0.0):>10.3f} s")
     print(f"  {'total':<26}{timings.get('total', 0.0):>10.3f} s")
-    print(f"  {'render_throughput':<26}{(pixel_count / render_time) / 1e6:>10.2f} MPix/s")
-    print(f"  {'overall_throughput':<26}{(pixel_count / total_time) / 1e6:>10.2f} MPix/s")
+    print(f"  {'render_throughput':<26}"
+          f"{(pixel_count / render_time) / 1e6:>10.2f} MPix/s")
+    print(f"  {'overall_throughput':<26}"
+          f"{(pixel_count / total_time) / 1e6:>10.2f} MPix/s")
 
 
-
-
+# ============================================================================
+# Cache
+# ============================================================================
 
 CACHE_FILE = "lookup_cache.npz"
 
 
-def _cache_params(height, width, fov, decimals, r_obs, alpha_crit):
-    return np.array([height, width, fov[0], fov[1], decimals, r_obs, alpha_crit])
+def _cache_params(height, width, fov, decimals, r_obs, alpha_crit,
+                  metric_name, metric_extra=None):
+    name_hash = float(hash(metric_name) % 2**32)
+    base = [height, width, fov[0], fov[1], decimals, r_obs, alpha_crit,
+            name_hash]
+    if metric_extra is not None:
+        base.extend(metric_extra)
+    return np.array(base)
 
 
-def load_lookup_cache(height, width, fov, decimals, r_obs, alpha_crit):
+def load_lookup_cache(height, width, fov, decimals, r_obs, alpha_crit,
+                      metric):
     if not os.path.isfile(CACHE_FILE):
         return None
     try:
         data = np.load(CACHE_FILE)
-        expected = _cache_params(height, width, fov, decimals, r_obs, alpha_crit)
+        metric_extra = _metric_extra(metric)
+        expected = _cache_params(height, width, fov, decimals, r_obs,
+                                 alpha_crit, type(metric).__name__,
+                                 metric_extra)
         if not np.allclose(data["params"], expected):
             return None
         if "winding_lookup" not in data:
             return None
-        winding = data["winding_lookup"]
         return (
             data["alpha_lookup"],
             data["final_alpha_lookup"],
-            winding,
-            int(data["unique_alpha_bins"]),
-            int(data["traced_alpha_bins"]),
+            data["winding_lookup"],
+            int(data["unique_bins"]),
+            int(data["traced_bins"]),
         )
     except Exception:
         return None
 
 
-def save_lookup_cache(
-    alpha_lookup, final_alpha_lookup, winding_lookup,
-    unique_alpha_bins, traced_alpha_bins,
-    height, width, fov, decimals, r_obs, alpha_crit,
-):
+def _metric_extra(metric):
+    """Extra float parameters to include in cache key."""
+    extra = [metric.M]
+    if hasattr(metric, 'a'):
+        extra.append(metric.a)
+    return extra
+
+
+def save_lookup_cache(alpha_lookup, final_alpha_lookup, winding_lookup,
+                      unique_bins, traced_bins,
+                      height, width, fov, decimals, r_obs, alpha_crit,
+                      metric):
+    metric_extra = _metric_extra(metric)
     np.savez(
         CACHE_FILE,
-        params=_cache_params(height, width, fov, decimals, r_obs, alpha_crit),
+        params=_cache_params(height, width, fov, decimals, r_obs, alpha_crit,
+                             type(metric).__name__, metric_extra),
         alpha_lookup=alpha_lookup,
         final_alpha_lookup=final_alpha_lookup,
         winding_lookup=winding_lookup,
-        unique_alpha_bins=np.array(unique_alpha_bins),
-        traced_alpha_bins=np.array(traced_alpha_bins),
+        unique_bins=np.array(unique_bins),
+        traced_bins=np.array(traced_bins),
     )
 
 
-def main():
-    debug_benchmark: bool = True
-    timings: dict[str, float] = {}
+# ============================================================================
+# Main
+# ============================================================================
+
+def main(metric=None, M=1.0, a=0.0):
+    if metric is None:
+        if a == 0:
+            metric = Schwarzschild(M=M)
+        else:
+            metric = Kerr(M=M, a=a)
+
+    print(f"Metric: {type(metric).__name__} "
+          f"(M={metric.M}, a={getattr(metric, 'a', 0)})")
+
+    debug_benchmark = True
+    timings = {}
     total_start = perf_counter()
 
-    # load image
+    # Load image
     stage_start = perf_counter()
     img = mpimg.imread('image.jpg')
-    
     if img.dtype == np.uint8:
         img = img.astype(np.float32) / 255.0
     timings["load_image"] = perf_counter() - stage_start
-    
+
     height, width = img.shape[:2]
-    
-    # obesrver properties
-    r_obs = 100.0 * M
-    alpha_crit_arg = B_CRIT * np.sqrt(1 - R_S / r_obs) / r_obs
-    alpha_crit = np.arcsin(np.clip(alpha_crit_arg, -1.0, 1.0))
-    
+    print(f"Image: {width}x{height}")
+
+    # Observer properties
+    r_obs = 100.0 * metric.M
+    alpha_crit = metric.alpha_crit(r_obs)
+    print(f"r_obs = {r_obs:.1f} M, alpha_crit = {np.degrees(alpha_crit):.4f} deg")
+
     vertical_fov_deg = 40.0
-    vertical_fov: float = np.radians(vertical_fov_deg)
+    vertical_fov = np.radians(vertical_fov_deg)
     horizontal_fov = 2 * np.arctan(np.tan(vertical_fov / 2) * width / height)
     fov = (horizontal_fov, vertical_fov)
-    
-    render_loop_around: bool = False # poor naming, I don't really know how to call this variable. If True, when the ray lands outside the bounds of the background image, it will be tiled instead of being marked as out of bounds.
-    
+
+    render_loop_around = False
     decimals = 4
-    cached = load_lookup_cache(height, width, fov, decimals, r_obs, alpha_crit)
+
+    # Try cache
+    cached = load_lookup_cache(height, width, fov, decimals, r_obs,
+                               alpha_crit, metric)
     if cached is not None:
-        alpha_lookup, final_alpha_lookup, winding_lookup, unique_alpha_bins, traced_alpha_bins = cached
-        timings["build_alpha_lookup"] = 0.0
-        timings["precompute_final_alpha"] = 0.0
+        (alpha_lookup, final_alpha_lookup, winding_lookup,
+         unique_bins, traced_bins) = cached
+        timings["build_lookup"] = 0.0
+        timings["precompute"] = 0.0
         print("Loaded lookup tables from cache.")
     else:
-        stage_start = perf_counter()
-        alpha_lookup = build_alpha_lookup((height, width), fov, decimals=decimals)
-        timings["build_alpha_lookup"] = perf_counter() - stage_start
+        if metric.is_spherically_symmetric:
+            # 1D alpha-only lookup (fast path)
+            print("Building 1D alpha lookup...")
+            stage_start = perf_counter()
+            alpha_lookup = build_alpha_lookup(
+                (height, width), fov, decimals=decimals)
+            timings["build_lookup"] = perf_counter() - stage_start
 
-        stage_start = perf_counter()
-        final_alpha_lookup, winding_lookup, unique_alpha_bins, traced_alpha_bins = precompute_final_alpha_lookup(alpha_lookup, alpha_crit, r_obs)
-        timings["precompute_final_alpha"] = perf_counter() - stage_start
+            stage_start = perf_counter()
+            (final_alpha_lookup, winding_lookup,
+             unique_bins, traced_bins) = precompute_final_alpha_lookup(
+                alpha_lookup, alpha_crit, r_obs, metric)
+            timings["precompute"] = perf_counter() - stage_start
+        else:
+            # 2D: reuse 1D alpha quantization + coarse theta bins
+            print("Building 2D (alpha, theta) lookup...")
+            stage_start = perf_counter()
+            alpha_lookup = build_alpha_lookup(
+                (height, width), fov, decimals=decimals)
+            timings["build_lookup"] = perf_counter() - stage_start
+
+            stage_start = perf_counter()
+            (final_alpha_lookup, winding_lookup,
+             unique_bins, traced_bins) = precompute_final_alpha_lookup_2d(
+                alpha_lookup, fov, alpha_crit, r_obs, metric,
+                n_theta_bins=4)
+            timings["precompute"] = perf_counter() - stage_start
 
         save_lookup_cache(
             alpha_lookup, final_alpha_lookup, winding_lookup,
-            unique_alpha_bins, traced_alpha_bins,
-            height, width, fov, decimals, r_obs, alpha_crit,
+            unique_bins, traced_bins,
+            height, width, fov, decimals, r_obs, alpha_crit, metric,
         )
         print("Saved lookup tables to cache.")
-    
+
+    # Render
     stage_start = perf_counter()
     lensed_image = render_lensed_image(
-        img,
-        alpha_lookup,
-        final_alpha_lookup,
-        winding_lookup,
-        alpha_crit,
-        fov,
-        render_loop_around,
+        img, alpha_lookup, final_alpha_lookup, winding_lookup,
+        alpha_crit, fov, render_loop_around,
     )
     timings["render"] = perf_counter() - stage_start
-    
-    
-    """
-    ! As I implement the alpha first look up table, this loop will become obsolete and will be replaced by a simple lookup from the precomputed table.
-    for y in tqdm(range(height), desc="Rendering", unit="row"):
-        for x in range(width):
-            angles = pixel_to_angles((y, x), (height, width), fov)
-            color = get_color_from_background(angles, img, fov, r_obs)
-            lensed_image[y, x] = color
-    """
-    
-    
-    # save output image
+
+    # Save
     stage_start = perf_counter()
     mpimg.imsave('lensed_image.png', lensed_image)
     timings["save_image"] = perf_counter() - stage_start
@@ -449,12 +530,14 @@ def main():
 
     if debug_benchmark:
         print_benchmark_summary(
-            (height, width),
-            alpha_crit,
-            unique_alpha_bins,
-            traced_alpha_bins,
-            timings,
-        )
+            (height, width), alpha_crit, unique_bins, traced_bins, timings)
+
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--M", type=float, default=1.0, help="BH mass")
+    parser.add_argument("--a", type=float, default=0.0,
+                        help="BH spin (|a| <= M, 0 = Schwarzschild)")
+    args = parser.parse_args()
+    main(M=args.M, a=args.a)
