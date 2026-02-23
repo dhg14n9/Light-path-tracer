@@ -302,7 +302,7 @@ def _all_finite8(x):
 
 @njit(cache=True)
 def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
-                          lambda_max, h_max):
+                          lambda_max, h_max, axis_refine):
     ok, state = _kerr_initial_conditions_numba(M, a, r_obs, alpha, theta, theta_obs)
     if not ok:
         return 0, np.nan, 0
@@ -319,10 +319,13 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
 
     lam = 0.0
     event_status = 2  # 1 escaped, -1 captured, 2 max-range
-    h_floor = min(0.02, h_max)
+    h_base = h_max
+    if axis_refine:
+        h_base = min(h_base, 0.5)
+    h_floor = min(0.01 if axis_refine else 0.02, h_base)
 
     while lam < lambda_max:
-        h = h_max
+        h = h_base
         remaining = lambda_max - lam
         if remaining < h:
             h = remaining
@@ -332,11 +335,11 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
         # Semi-adaptive stepping near the horizon / high-curvature region.
         r_curr = state[1]
         if r_curr < r_capture * 4.0:
-            h = min(h, 0.25)
+            h = min(h, 0.20 if axis_refine else 0.25)
         if r_curr < r_capture * 2.0:
-            h = min(h, 0.10)
+            h = min(h, 0.08 if axis_refine else 0.10)
         if r_curr < r_capture * 1.2:
-            h = min(h, 0.05)
+            h = min(h, 0.03 if axis_refine else 0.05)
 
         r_prev = state[1]
         step_ok = False
@@ -461,7 +464,7 @@ class Metric(ABC):
 
     @abstractmethod
     def trace_ray(self, r_obs, alpha, theta=0.0, theta_obs=np.pi / 2,
-                  phi_max=50.0):
+                  phi_max=50.0, axis_refine=False):
         """Trace a ray, return (final_alpha, n_half_orbits, outcome).
 
         final_alpha: deflected viewing angle of escaping photon (radians).
@@ -855,7 +858,7 @@ class Kerr(Metric):
         """
         status, final_alpha, n_half_orbits = _kerr_trace_ray_numba(
             self.M, self.a, self.r_plus, r_obs, alpha, theta, theta_obs,
-            5000.0, 1.0)
+            5000.0, 1.0, axis_refine)
         if status == 0:
             return np.nan, 0, 'invalid'
         if status == -1:

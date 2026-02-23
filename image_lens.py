@@ -12,6 +12,7 @@ from metrics import Schwarzschild, Kerr
 
 WINDING_DTYPE = np.uint16
 WINDING_MAX = np.iinfo(WINDING_DTYPE).max
+Y_AXIS_REFINE_FRAC = 0.07
 
 
 # ============================================================================
@@ -106,9 +107,15 @@ def _trace_single_alpha(args):
 
 def _trace_single_alpha_theta(args):
     """Trace one (alpha, theta) bin (2D, for non-spherically symmetric)."""
-    idx, alpha, screen_theta, r_obs, theta_obs = args
-    final_alpha, n_half_orbits, outcome = _worker_metric.trace_ray(
-        r_obs, alpha, theta=screen_theta, theta_obs=theta_obs)
+    idx, alpha, screen_theta, r_obs, theta_obs, axis_refine = args
+    try:
+        final_alpha, n_half_orbits, outcome = _worker_metric.trace_ray(
+            r_obs, alpha, theta=screen_theta, theta_obs=theta_obs,
+            axis_refine=bool(axis_refine))
+    except TypeError:
+        # Fallback for metrics that do not expose axis_refine.
+        final_alpha, n_half_orbits, outcome = _worker_metric.trace_ray(
+            r_obs, alpha, theta=screen_theta, theta_obs=theta_obs)
     if outcome != 'escaped':
         return (idx, np.nan, 0)
     return (idx, final_alpha, n_half_orbits)
@@ -176,17 +183,32 @@ def precompute_final_alpha_lookup_2d(
     x_cam = (np.arange(width) - width / 2) / fx
     y_cam = (np.arange(height) - height / 2) / fy
     theta_pixel = np.arctan2(x_cam[None, :], y_cam[:, None])
+    x_cam_abs_max = max(float(np.max(np.abs(x_cam))), 1e-12)
+    axis_refine_cols = np.abs(x_cam) <= (Y_AXIS_REFINE_FRAC * x_cam_abs_max)
 
-    alpha_flat = alpha_lookup.ravel()
-    theta_flat = theta_pixel.ravel()
+    use_tb_symmetry = np.isclose(theta_obs, np.pi / 2)
+    trace_rows = (height + 1) // 2 if use_tb_symmetry else height
 
-    valid_indices = np.arange(alpha_flat.size, dtype=np.intp)
+    alpha_trace = alpha_lookup[:trace_rows, :]
+    theta_trace = theta_pixel[:trace_rows, :]
+    axis_refine_trace = np.broadcast_to(axis_refine_cols[None, :],
+                                        (trace_rows, width))
 
-    final_alpha_flat = np.full(alpha_flat.shape, np.nan, dtype=np.float32)
-    winding_flat = np.zeros(alpha_flat.shape, dtype=WINDING_DTYPE)
+    alpha_trace_flat = alpha_trace.ravel()
+    theta_trace_flat = theta_trace.ravel()
+    axis_refine_trace_flat = axis_refine_trace.ravel()
+    valid_indices = np.arange(alpha_trace_flat.size, dtype=np.intp)
 
-    print(f"  tracing {valid_indices.size:,} rays "
-          f"({alpha_flat.size:,} pixels total)")
+    final_alpha_trace_flat = np.full(alpha_trace_flat.shape, np.nan,
+                                     dtype=np.float32)
+    winding_trace_flat = np.zeros(alpha_trace_flat.shape, dtype=WINDING_DTYPE)
+
+    if use_tb_symmetry:
+        print(f"  tracing {valid_indices.size:,} rays with top/bottom symmetry "
+              f"({alpha_lookup.size:,} pixels total)")
+    else:
+        print(f"  tracing {valid_indices.size:,} rays "
+              f"({alpha_lookup.size:,} pixels total)")
 
     if valid_indices.size:
         metric_kwargs = {'M': metric.M}
@@ -199,8 +221,10 @@ def precompute_final_alpha_lookup_2d(
             initargs=(type(metric).__name__, metric_kwargs),
         ) as executor:
             task_iter = (
-                (int(idx), float(alpha_flat[idx]), float(theta_flat[idx]),
-                 r_obs, theta_obs)
+                (int(idx), float(alpha_trace_flat[idx]),
+                 float(theta_trace_flat[idx]),
+                 r_obs, theta_obs,
+                 bool(axis_refine_trace_flat[idx]))
                 for idx in valid_indices
             )
             for idx, final_alpha, n_half_orbits in tqdm(
@@ -210,12 +234,27 @@ def precompute_final_alpha_lookup_2d(
                 desc="Tracing per-pixel rays",
                 unit="ray",
             ):
-                final_alpha_flat[idx] = final_alpha
-                winding_flat[idx] = min(int(n_half_orbits), WINDING_MAX)
+                final_alpha_trace_flat[idx] = final_alpha
+                winding_trace_flat[idx] = min(int(n_half_orbits), WINDING_MAX)
 
-    return (final_alpha_flat.reshape(shape),
-            winding_flat.reshape(shape),
-            int(alpha_flat.size), int(valid_indices.size))
+    final_alpha_out = np.full(shape, np.nan, dtype=np.float32)
+    winding_out = np.zeros(shape, dtype=WINDING_DTYPE)
+
+    final_alpha_trace = final_alpha_trace_flat.reshape((trace_rows, width))
+    winding_trace = winding_trace_flat.reshape((trace_rows, width))
+
+    final_alpha_out[:trace_rows, :] = final_alpha_trace
+    winding_out[:trace_rows, :] = winding_trace
+
+    if use_tb_symmetry:
+        top_half = height // 2
+        if top_half > 0:
+            final_alpha_out[height - top_half:, :] = final_alpha_out[:top_half, :][::-1, :]
+            winding_out[height - top_half:, :] = winding_out[:top_half, :][::-1, :]
+
+    return (final_alpha_out,
+            winding_out,
+            int(alpha_lookup.size), int(valid_indices.size))
 
 
 # ============================================================================
