@@ -4,11 +4,14 @@
 import numpy as np
 import matplotlib.image as mpimg
 from tqdm import tqdm
-import os
 from time import perf_counter
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 
 from metrics import Schwarzschild, Kerr
+
+
+WINDING_DTYPE = np.uint16
+WINDING_MAX = np.iinfo(WINDING_DTYPE).max
 
 
 # ============================================================================
@@ -62,7 +65,7 @@ def angles_to_pixel(angles, image_dimension, fov, clip=False):
 # Alpha lookup (1D, for spherically symmetric metrics)
 # ============================================================================
 
-def build_alpha_lookup(image_dimension, fov, decimals=4):
+def build_alpha_lookup(image_dimension, fov, decimals=None):
     """Build a per-pixel alpha lookup table (vectorized)."""
     height, width = image_dimension
     horizontal_fov, vertical_fov = fov
@@ -74,7 +77,9 @@ def build_alpha_lookup(image_dimension, fov, decimals=4):
     y_cam = (np.arange(height) - height / 2) / fy
 
     alpha = np.arctan2(np.hypot(x_cam[None, :], y_cam[:, None]), 1.0)
-    return np.round(alpha, decimals).astype(np.float32)
+    if decimals is not None:
+        alpha = np.round(alpha, decimals)
+    return alpha.astype(np.float32)
 
 
 # Global reference to metric for multiprocessing workers
@@ -113,26 +118,17 @@ def precompute_final_alpha_lookup(
     alpha_lookup, alpha_crit, r_obs, metric,
     num_worker=None,
 ):
-    """Precompute per-pixel final alpha by tracing unique alpha bins (1D).
+    """Trace one ray per pixel (1D alpha-only, spherically symmetric)."""
+    alpha_flat = alpha_lookup.ravel()
+    valid_indices = np.arange(alpha_flat.size, dtype=np.intp)
 
-    For spherically symmetric metrics only.
-    """
-    unique_alpha, inverse_alpha_idx = np.unique(
-        alpha_lookup, return_inverse=True)
-    valid_unique_mask = unique_alpha >= alpha_crit
-    valid_indices = np.flatnonzero(valid_unique_mask)
+    final_alpha_flat = np.full(alpha_flat.shape, np.nan, dtype=np.float32)
+    winding_flat = np.zeros(alpha_flat.shape, dtype=WINDING_DTYPE)
 
-    final_alpha_for_unique = np.full(unique_alpha.shape, np.nan,
-                                     dtype=np.float32)
-    winding_for_unique = np.zeros(unique_alpha.shape, dtype=np.int16)
-
-    tasks = [(idx, unique_alpha[idx], r_obs) for idx in valid_indices]
-
-    if not tasks:
-        flat = inverse_alpha_idx.reshape(alpha_lookup.shape)
-        return (final_alpha_for_unique[flat],
-                winding_for_unique[flat],
-                int(unique_alpha.size), int(valid_indices.size))
+    if valid_indices.size == 0:
+        return (final_alpha_flat.reshape(alpha_lookup.shape),
+                winding_flat.reshape(alpha_lookup.shape),
+                int(alpha_flat.size), 0)
 
     metric_kwargs = {'M': metric.M}
     if hasattr(metric, 'a'):
@@ -143,18 +139,22 @@ def precompute_final_alpha_lookup(
         initializer=_init_worker,
         initargs=(type(metric).__name__, metric_kwargs),
     ) as executor:
-        futures = [executor.submit(_trace_single_alpha, task)
-                   for task in tasks]
-        for future in tqdm(as_completed(futures), total=len(futures),
-                           desc="Precomputing alpha lookup", unit="alpha"):
-            idx, final_alpha, n_half_orbits = future.result()
-            final_alpha_for_unique[idx] = final_alpha
-            winding_for_unique[idx] = n_half_orbits
+        task_iter = (
+            (int(idx), float(alpha_flat[idx]), r_obs)
+            for idx in valid_indices
+        )
+        for idx, final_alpha, n_half_orbits in tqdm(
+            executor.map(_trace_single_alpha, task_iter, chunksize=256),
+            total=int(valid_indices.size),
+            desc="Tracing per-pixel rays",
+            unit="ray",
+        ):
+            final_alpha_flat[idx] = final_alpha
+            winding_flat[idx] = min(int(n_half_orbits), WINDING_MAX)
 
-    flat = inverse_alpha_idx.reshape(alpha_lookup.shape)
-    return (final_alpha_for_unique[flat],
-            winding_for_unique[flat],
-            int(unique_alpha.size), int(valid_indices.size))
+    return (final_alpha_flat.reshape(alpha_lookup.shape),
+            winding_flat.reshape(alpha_lookup.shape),
+            int(alpha_flat.size), int(valid_indices.size))
 
 
 # ============================================================================
@@ -163,21 +163,11 @@ def precompute_final_alpha_lookup(
 
 def precompute_final_alpha_lookup_2d(
     alpha_lookup, fov, alpha_crit, r_obs, metric,
-    n_theta_bins=32, theta_obs=np.pi / 2, num_worker=None,
+    theta_obs=np.pi / 2, num_worker=None,
 ):
-    """Precompute per-pixel final alpha for non-spherically-symmetric metrics.
-
-    Uses unique alpha bins (same as 1D) × coarse theta bins.
-    Reflection symmetry theta -> -theta halves the work for equatorial
-    observers.
-    """
+    """Trace one ray per pixel for non-spherically-symmetric metrics."""
     shape = alpha_lookup.shape
     height, width = shape
-
-    # Unique alphas (same strategy as 1D)
-    unique_alpha, inv_alpha = np.unique(alpha_lookup, return_inverse=True)
-    inv_alpha = inv_alpha.reshape(shape)
-    n_alpha = len(unique_alpha)
 
     # Per-pixel screen theta
     hfov, vfov = fov
@@ -187,42 +177,18 @@ def precompute_final_alpha_lookup_2d(
     y_cam = (np.arange(height) - height / 2) / fy
     theta_pixel = np.arctan2(x_cam[None, :], y_cam[:, None])
 
-    # Theta binning (|theta| symmetry for equatorial observer)
-    use_symmetry = np.isclose(theta_obs, np.pi / 2)
-    if use_symmetry:
-        theta_for_bin = np.abs(theta_pixel)
-        theta_edges = np.linspace(0, np.pi, n_theta_bins + 1)
-    else:
-        theta_for_bin = theta_pixel
-        theta_edges = np.linspace(-np.pi, np.pi, n_theta_bins + 1)
+    alpha_flat = alpha_lookup.ravel()
+    theta_flat = theta_pixel.ravel()
 
-    theta_bin_idx = np.clip(
-        np.digitize(theta_for_bin, theta_edges) - 1,
-        0, n_theta_bins - 1)
-    theta_centers = 0.5 * (theta_edges[:-1] + theta_edges[1:])
+    valid_indices = np.arange(alpha_flat.size, dtype=np.intp)
 
-    # Valid alpha mask
-    valid_alpha_mask = unique_alpha >= alpha_crit
-    valid_alpha_indices = np.flatnonzero(valid_alpha_mask)
+    final_alpha_flat = np.full(alpha_flat.shape, np.nan, dtype=np.float32)
+    winding_flat = np.zeros(alpha_flat.shape, dtype=WINDING_DTYPE)
 
-    # Result grid: (n_alpha, n_theta_bins)
-    final_alpha_grid = np.full(
-        (n_alpha, n_theta_bins), np.nan, dtype=np.float32)
-    winding_grid = np.zeros((n_alpha, n_theta_bins), dtype=np.int16)
+    print(f"  tracing {valid_indices.size:,} rays "
+          f"({alpha_flat.size:,} pixels total)")
 
-    # Build tasks for valid (alpha, theta_bin) pairs
-    tasks = []
-    for ai in valid_alpha_indices:
-        for ti in range(n_theta_bins):
-            grid_idx = int(ai) * n_theta_bins + ti
-            tasks.append((grid_idx, float(unique_alpha[ai]),
-                          float(theta_centers[ti]), r_obs, theta_obs))
-
-    n_grid = n_alpha * n_theta_bins
-    print(f"  {n_alpha} unique alphas x {n_theta_bins} theta bins "
-          f"= {n_grid:,} grid points, {len(tasks):,} to trace")
-
-    if tasks:
+    if valid_indices.size:
         metric_kwargs = {'M': metric.M}
         if hasattr(metric, 'a'):
             metric_kwargs['a'] = metric.a
@@ -232,22 +198,24 @@ def precompute_final_alpha_lookup_2d(
             initializer=_init_worker,
             initargs=(type(metric).__name__, metric_kwargs),
         ) as executor:
-            futures = [executor.submit(_trace_single_alpha_theta, task)
-                       for task in tasks]
-            for future in tqdm(
-                as_completed(futures), total=len(futures),
-                desc="Tracing rays", unit="ray",
+            task_iter = (
+                (int(idx), float(alpha_flat[idx]), float(theta_flat[idx]),
+                 r_obs, theta_obs)
+                for idx in valid_indices
+            )
+            for idx, final_alpha, n_half_orbits in tqdm(
+                executor.map(_trace_single_alpha_theta, task_iter,
+                             chunksize=256),
+                total=int(valid_indices.size),
+                desc="Tracing per-pixel rays",
+                unit="ray",
             ):
-                grid_idx, final_alpha, n_half_orbits = future.result()
-                ai = grid_idx // n_theta_bins
-                ti = grid_idx % n_theta_bins
-                final_alpha_grid[ai, ti] = final_alpha
-                winding_grid[ai, ti] = n_half_orbits
+                final_alpha_flat[idx] = final_alpha
+                winding_flat[idx] = min(int(n_half_orbits), WINDING_MAX)
 
-    # Map grid → pixels
-    final_alpha_out = final_alpha_grid[inv_alpha, theta_bin_idx]
-    winding_out = winding_grid[inv_alpha, theta_bin_idx]
-    return (final_alpha_out, winding_out, n_grid, len(tasks))
+    return (final_alpha_flat.reshape(shape),
+            winding_flat.reshape(shape),
+            int(alpha_flat.size), int(valid_indices.size))
 
 
 # ============================================================================
@@ -337,8 +305,8 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
 # Benchmark
 # ============================================================================
 
-def print_benchmark_summary(image_dimension, alpha_crit, unique_bins,
-                            traced_bins, timings):
+def print_benchmark_summary(image_dimension, alpha_crit, total_rays,
+                            traced_rays, timings):
     height, width = image_dimension
     pixel_count = width * height
     render_time = max(timings.get("render", 0.0), 1e-12)
@@ -347,8 +315,8 @@ def print_benchmark_summary(image_dimension, alpha_crit, unique_bins,
     print("\nBenchmark summary")
     print(f"  resolution: {width}x{height} ({pixel_count:,} pixels)")
     print(f"  alpha_crit: {alpha_crit:.6f} rad")
-    print(f"  unique bins: {unique_bins:,}")
-    print(f"  traced bins: {traced_bins:,}")
+    print(f"  total rays: {total_rays:,}")
+    print(f"  traced rays: {traced_rays:,}")
     print(f"  {'load_image':<26}{timings.get('load_image', 0.0):>10.3f} s")
     print(f"  {'build_lookup':<26}{timings.get('build_lookup', 0.0):>10.3f} s")
     print(f"  {'precompute':<26}{timings.get('precompute', 0.0):>10.3f} s")
@@ -359,73 +327,6 @@ def print_benchmark_summary(image_dimension, alpha_crit, unique_bins,
           f"{(pixel_count / render_time) / 1e6:>10.2f} MPix/s")
     print(f"  {'overall_throughput':<26}"
           f"{(pixel_count / total_time) / 1e6:>10.2f} MPix/s")
-
-
-# ============================================================================
-# Cache
-# ============================================================================
-
-CACHE_FILE = "lookup_cache.npz"
-
-
-def _cache_params(height, width, fov, decimals, r_obs, alpha_crit,
-                  metric_name, metric_extra=None):
-    name_hash = float(hash(metric_name) % 2**32)
-    base = [height, width, fov[0], fov[1], decimals, r_obs, alpha_crit,
-            name_hash]
-    if metric_extra is not None:
-        base.extend(metric_extra)
-    return np.array(base)
-
-
-def load_lookup_cache(height, width, fov, decimals, r_obs, alpha_crit,
-                      metric):
-    if not os.path.isfile(CACHE_FILE):
-        return None
-    try:
-        data = np.load(CACHE_FILE)
-        metric_extra = _metric_extra(metric)
-        expected = _cache_params(height, width, fov, decimals, r_obs,
-                                 alpha_crit, type(metric).__name__,
-                                 metric_extra)
-        if not np.allclose(data["params"], expected):
-            return None
-        if "winding_lookup" not in data:
-            return None
-        return (
-            data["alpha_lookup"],
-            data["final_alpha_lookup"],
-            data["winding_lookup"],
-            int(data["unique_bins"]),
-            int(data["traced_bins"]),
-        )
-    except Exception:
-        return None
-
-
-def _metric_extra(metric):
-    """Extra float parameters to include in cache key."""
-    extra = [metric.M]
-    if hasattr(metric, 'a'):
-        extra.append(metric.a)
-    return extra
-
-
-def save_lookup_cache(alpha_lookup, final_alpha_lookup, winding_lookup,
-                      unique_bins, traced_bins,
-                      height, width, fov, decimals, r_obs, alpha_crit,
-                      metric):
-    metric_extra = _metric_extra(metric)
-    np.savez(
-        CACHE_FILE,
-        params=_cache_params(height, width, fov, decimals, r_obs, alpha_crit,
-                             type(metric).__name__, metric_extra),
-        alpha_lookup=alpha_lookup,
-        final_alpha_lookup=final_alpha_lookup,
-        winding_lookup=winding_lookup,
-        unique_bins=np.array(unique_bins),
-        traced_bins=np.array(traced_bins),
-    )
 
 
 # ============================================================================
@@ -467,52 +368,28 @@ def main(metric=None, M=1.0, a=0.0):
     fov = (horizontal_fov, vertical_fov)
 
     render_loop_around = False
-    decimals = 4
+    if metric.is_spherically_symmetric:
+        print("Building per-pixel alpha lookup...")
+        stage_start = perf_counter()
+        alpha_lookup = build_alpha_lookup((height, width), fov)
+        timings["build_lookup"] = perf_counter() - stage_start
 
-    # Try cache
-    cached = load_lookup_cache(height, width, fov, decimals, r_obs,
-                               alpha_crit, metric)
-    if cached is not None:
-        (alpha_lookup, final_alpha_lookup, winding_lookup,
-         unique_bins, traced_bins) = cached
-        timings["build_lookup"] = 0.0
-        timings["precompute"] = 0.0
-        print("Loaded lookup tables from cache.")
+        stage_start = perf_counter()
+        (final_alpha_lookup, winding_lookup,
+         total_rays, traced_rays) = precompute_final_alpha_lookup(
+            alpha_lookup, alpha_crit, r_obs, metric)
+        timings["precompute"] = perf_counter() - stage_start
     else:
-        if metric.is_spherically_symmetric:
-            # 1D alpha-only lookup (fast path)
-            print("Building 1D alpha lookup...")
-            stage_start = perf_counter()
-            alpha_lookup = build_alpha_lookup(
-                (height, width), fov, decimals=decimals)
-            timings["build_lookup"] = perf_counter() - stage_start
+        print("Building per-pixel (alpha, theta) lookup...")
+        stage_start = perf_counter()
+        alpha_lookup = build_alpha_lookup((height, width), fov)
+        timings["build_lookup"] = perf_counter() - stage_start
 
-            stage_start = perf_counter()
-            (final_alpha_lookup, winding_lookup,
-             unique_bins, traced_bins) = precompute_final_alpha_lookup(
-                alpha_lookup, alpha_crit, r_obs, metric)
-            timings["precompute"] = perf_counter() - stage_start
-        else:
-            # 2D: reuse 1D alpha quantization + coarse theta bins
-            print("Building 2D (alpha, theta) lookup...")
-            stage_start = perf_counter()
-            alpha_lookup = build_alpha_lookup(
-                (height, width), fov, decimals=decimals)
-            timings["build_lookup"] = perf_counter() - stage_start
-
-            stage_start = perf_counter()
-            (final_alpha_lookup, winding_lookup,
-             unique_bins, traced_bins) = precompute_final_alpha_lookup_2d(
-                alpha_lookup, fov, alpha_crit, r_obs, metric,
-                n_theta_bins=4)
-            timings["precompute"] = perf_counter() - stage_start
-
-        save_lookup_cache(
-            alpha_lookup, final_alpha_lookup, winding_lookup,
-            unique_bins, traced_bins,
-            height, width, fov, decimals, r_obs, alpha_crit, metric,
-        )
-        print("Saved lookup tables to cache.")
+        stage_start = perf_counter()
+        (final_alpha_lookup, winding_lookup,
+         total_rays, traced_rays) = precompute_final_alpha_lookup_2d(
+            alpha_lookup, fov, alpha_crit, r_obs, metric)
+        timings["precompute"] = perf_counter() - stage_start
 
     # Render
     stage_start = perf_counter()
@@ -530,7 +407,7 @@ def main(metric=None, M=1.0, a=0.0):
 
     if debug_benchmark:
         print_benchmark_summary(
-            (height, width), alpha_crit, unique_bins, traced_bins, timings)
+            (height, width), alpha_crit, total_rays, traced_rays, timings)
 
 
 if __name__ == "__main__":
