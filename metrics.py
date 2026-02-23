@@ -293,6 +293,14 @@ def _rk4_step_kerr_numba(state, h, M, a, r_plus, k1, k2, k3, k4, tmp, out_state)
 
 
 @njit(cache=True)
+def _all_finite8(x):
+    for i in range(8):
+        if not np.isfinite(x[i]):
+            return False
+    return True
+
+
+@njit(cache=True)
 def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
                           lambda_max, h_max):
     ok, state = _kerr_initial_conditions_numba(M, a, r_obs, alpha, theta, theta_obs)
@@ -311,6 +319,7 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
 
     lam = 0.0
     event_status = 2  # 1 escaped, -1 captured, 2 max-range
+    h_floor = min(0.02, h_max)
 
     while lam < lambda_max:
         h = h_max
@@ -320,9 +329,33 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
         if h <= 0.0:
             break
 
-        r_prev = state[1]
+        # Semi-adaptive stepping near the horizon / high-curvature region.
+        r_curr = state[1]
+        if r_curr < r_capture * 4.0:
+            h = min(h, 0.25)
+        if r_curr < r_capture * 2.0:
+            h = min(h, 0.10)
+        if r_curr < r_capture * 1.2:
+            h = min(h, 0.05)
 
-        _rk4_step_kerr_numba(state, h, M, a, r_plus, k1, k2, k3, k4, tmp, next_state)
+        r_prev = state[1]
+        step_ok = False
+
+        while True:
+            _rk4_step_kerr_numba(
+                state, h, M, a, r_plus, k1, k2, k3, k4, tmp, next_state)
+
+            if (_all_finite8(next_state)
+                    and np.isfinite(next_state[1])
+                    and next_state[1] > 0.0):
+                step_ok = True
+                break
+
+            if h <= h_floor:
+                return 0, np.nan, 0
+
+            h *= 0.5
+
         r_next = next_state[1]
 
         if r_prev > r_capture and r_next <= r_capture:
@@ -349,6 +382,9 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
             state[i] = next_state[i]
         lam += h
 
+        if not _all_finite8(state):
+            return 0, np.nan, 0
+
     r_f = state[1]
     th_f = state[2]
     phi_f = state[3]
@@ -361,6 +397,8 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
 
     if r_f <= r_capture * 1.1 or event_status == -1:
         return -1, np.nan, n_half_orbits
+    if (not np.isfinite(r_f) or not np.isfinite(th_f) or not np.isfinite(phi_f)):
+        return 0, np.nan, 0
 
     sin_th = np.sin(th_f)
     cos_th = np.cos(th_f)
@@ -369,6 +407,8 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
         sin_th_sq = 1e-15
     Sigma_f = r_f * r_f + a * a * cos_th * cos_th
     Delta_f = r_f * r_f - 2.0 * M * r_f + a * a
+    if Sigma_f <= 1e-15 or np.abs(Delta_f) <= 1e-15:
+        return 0, np.nan, n_half_orbits
 
     dr_dl = Delta_f / Sigma_f * p_r_f
     dth_dl = p_th_f / Sigma_f
@@ -385,6 +425,9 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
           + r_f * cos_th * sin_phi * dth_dl
           + r_f * sin_th * cos_phi * dphi_dl)
     vz = cos_th * dr_dl - r_f * sin_th * dth_dl
+
+    if (not np.isfinite(vx) or not np.isfinite(vy) or not np.isfinite(vz)):
+        return 0, np.nan, n_half_orbits
 
     v_mag = np.sqrt(vx * vx + vy * vy + vz * vz)
     if v_mag < 1e-30:
