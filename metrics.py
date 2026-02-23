@@ -570,7 +570,7 @@ class Schwarzschild(Metric):
         return [w, -u + 3 * self.M * u**2]
 
     def trace_ray(self, r_obs, alpha, theta=0.0, theta_obs=np.pi / 2,
-                  phi_max=50.0):
+                  phi_max=50.0, axis_refine=False):
         """Trace using the orbit equation shortcut.
 
         Returns (final_alpha, n_half_orbits, outcome).
@@ -851,7 +851,7 @@ class Kerr(Metric):
     # -- Ray tracing (full numerical integration) ----------------------------
 
     def trace_ray(self, r_obs, alpha, theta=0.0, theta_obs=np.pi / 2,
-                  phi_max=50.0):
+                  phi_max=50.0, axis_refine=False):
         """Trace a ray numerically.
 
         Returns (final_alpha, n_half_orbits, outcome).
