@@ -397,7 +397,8 @@ def print_benchmark_summary(image_dimension, alpha_crit, total_rays,
 # Main
 # ============================================================================
 
-def main(metric=None, M=1.0, a=0.0, psi=(0.0, 0.0), vertical_fov_deg=40.0):
+def main(metric=None, M=1.0, a=0.0, r_obs_mult=100.0,
+         psi=(0.0, 0.0), vertical_fov_deg=40.0):
     if metric is None:
         if a == 0:
             metric = Schwarzschild(M=M)
@@ -422,7 +423,7 @@ def main(metric=None, M=1.0, a=0.0, psi=(0.0, 0.0), vertical_fov_deg=40.0):
     print(f"Image: {width}x{height}")
 
     # Observer properties
-    r_obs = 100.0 * metric.M
+    r_obs = r_obs_mult * metric.M
     alpha_crit = metric.alpha_crit(r_obs)
     print(f"r_obs = {r_obs:.1f} M, alpha_crit = {np.degrees(alpha_crit):.4f} deg")
 
@@ -486,6 +487,8 @@ if __name__ == "__main__":
     parser.add_argument("--M", type=float, default=1.0, help="BH mass")
     parser.add_argument("--a", type=float, default=0.0,
                         help="BH spin (|a| <= M, 0 = Schwarzschild)")
+    parser.add_argument("--r-obs", type=float, default=100.0,
+                        help="Observer distance in units of M (default: 100)")
     parser.add_argument("--psi-y", type=float, default=0.0,
                         help="BH vertical offset in deg (+ = top, - = bottom)")
     parser.add_argument("--psi-x", type=float, default=0.0,
@@ -493,6 +496,6 @@ if __name__ == "__main__":
     parser.add_argument("--fov-v", type=float, default=40.0,
                         help="Vertical field of view in deg")
     args = parser.parse_args()
-    main(M=args.M, a=args.a,
+    main(M=args.M, a=args.a, r_obs_mult=args.r_obs,
          psi=(np.radians(args.psi_y), np.radians(args.psi_x)),
          vertical_fov_deg=args.fov_v)
