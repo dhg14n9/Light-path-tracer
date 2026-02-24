@@ -19,11 +19,55 @@ Y_AXIS_REFINE_FRAC = 0.07
 # Pixel <-> angle conversions
 # ============================================================================
 
-def _psi_to_cam_offset(psi):
-    """Convert BH screen offset psi=(psi_y, psi_x) [rad] to camera-plane offset."""
+def _psi_to_bh_direction(psi):
+    """Convert psi=(pitch_up, yaw_right) [rad] to a BH direction in camera coords."""
     psi_y, psi_x = psi
-    # Image y grows downward, but psi_y > 0 means "move BH upward".
-    return (-np.tan(psi_y), np.tan(psi_x))
+    sin_pitch = np.sin(psi_y)
+    cos_pitch = np.cos(psi_y)
+    sin_yaw = np.sin(psi_x)
+    cos_yaw = np.cos(psi_x)
+
+    # Camera axes: +x right, +y down, +z forward.
+    # psi_y > 0 means BH moves upward, hence negative y component.
+    return np.array([
+        sin_yaw * cos_pitch,
+        -sin_pitch,
+        cos_yaw * cos_pitch,
+    ], dtype=np.float64)
+
+
+def _psi_frame(psi):
+    """Return (d, e_x, e_y, in_front) for BH direction and local screen basis."""
+    d = _psi_to_bh_direction(psi)
+    in_front = bool(d[2] > 1e-12)
+
+    cam_x = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    cam_y = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
+    # Tangent basis around the BH direction. e_x/e_y align with image axes at psi=0.
+    e_x = cam_x - np.dot(cam_x, d) * d
+    e_x_norm = np.linalg.norm(e_x)
+    if e_x_norm < 1e-12:
+        e_x = cam_y - np.dot(cam_y, d) * d
+        e_x_norm = np.linalg.norm(e_x)
+    e_x /= max(e_x_norm, 1e-12)
+
+    e_y = cam_y - np.dot(cam_y, d) * d - np.dot(cam_y, e_x) * e_x
+    e_y_norm = np.linalg.norm(e_y)
+    if e_y_norm < 1e-12:
+        e_y = np.cross(d, e_x)
+        e_y_norm = np.linalg.norm(e_y)
+    e_y /= max(e_y_norm, 1e-12)
+
+    return d, e_x, e_y, in_front
+
+
+def _psi_to_cam_projection(psi):
+    """Project BH direction onto the pinhole camera plane; returns (y_cam, x_cam, in_front)."""
+    d, _, _, in_front = _psi_frame(psi)
+    if not in_front:
+        return (np.nan, np.nan, False)
+    return (float(d[1] / d[2]), float(d[0] / d[2]), True)
 
 
 def pixel_to_angles(pixel, image_dimension, fov, psi=(0.0, 0.0)):
@@ -38,12 +82,17 @@ def pixel_to_angles(pixel, image_dimension, fov, psi=(0.0, 0.0)):
 
     x_cam = x / fx
     y_cam = y / fy
-    bh_y_cam, bh_x_cam = _psi_to_cam_offset(psi)
-    x_cam -= bh_x_cam
-    y_cam -= bh_y_cam
 
-    alpha = np.arctan2(np.sqrt(x_cam**2 + y_cam**2), 1.0)
-    theta = np.arctan2(x_cam, y_cam)
+    d, e_x, e_y, in_front = _psi_frame(psi)
+    if not in_front:
+        raise ValueError("psi points the black hole behind the camera (z <= 0)")
+
+    ray = np.array([x_cam, y_cam, 1.0], dtype=np.float64)
+    ray /= np.linalg.norm(ray)
+
+    cos_alpha = np.clip(np.dot(ray, d), -1.0, 1.0)
+    alpha = float(np.arccos(cos_alpha))
+    theta = float(np.arctan2(np.dot(ray, e_x), np.dot(ray, e_y)))
     return (alpha, theta)
 
 
@@ -55,12 +104,19 @@ def angles_to_pixel(angles, image_dimension, fov, clip=False, psi=(0.0, 0.0)):
     fx = (width / 2) / np.tan(horizontal_fov / 2)
     fy = (height / 2) / np.tan(vertical_fov / 2)
 
-    r_cam = np.tan(alpha)
-    x_cam = r_cam * np.sin(theta)
-    y_cam = r_cam * np.cos(theta)
-    bh_y_cam, bh_x_cam = _psi_to_cam_offset(psi)
-    x_cam += bh_x_cam
-    y_cam += bh_y_cam
+    d, e_x, e_y, in_front = _psi_frame(psi)
+    if not in_front:
+        raise ValueError("psi points the black hole behind the camera (z <= 0)")
+
+    ray = (np.cos(alpha) * d
+           + np.sin(alpha) * (np.sin(theta) * e_x + np.cos(theta) * e_y))
+    if ray[2] <= 1e-12:
+        if not clip:
+            return (-1, -1)
+        return (0, 0)
+
+    x_cam = ray[0] / ray[2]
+    y_cam = ray[1] / ray[2]
 
     x = x_cam * fx
     y = y_cam * fy
@@ -89,11 +145,15 @@ def build_alpha_lookup(image_dimension, fov, decimals=None, psi=(0.0, 0.0)):
 
     x_cam = (np.arange(width) - width / 2) / fx
     y_cam = (np.arange(height) - height / 2) / fy
-    bh_y_cam, bh_x_cam = _psi_to_cam_offset(psi)
-    x_cam = x_cam - bh_x_cam
-    y_cam = y_cam - bh_y_cam
+    d, _, _, in_front = _psi_frame(psi)
+    if not in_front:
+        raise ValueError("psi points the black hole behind the camera (z <= 0)")
 
-    alpha = np.arctan2(np.hypot(x_cam[None, :], y_cam[:, None]), 1.0)
+    denom = np.sqrt(1.0 + x_cam[None, :]**2 + y_cam[:, None]**2)
+    cos_alpha = ((x_cam[None, :] * d[0])
+                 + (y_cam[:, None] * d[1])
+                 + d[2]) / denom
+    alpha = np.arccos(np.clip(cos_alpha, -1.0, 1.0))
     if decimals is not None:
         alpha = np.round(alpha, decimals)
     return alpha.astype(np.float32)
@@ -198,12 +258,23 @@ def precompute_final_alpha_lookup_2d(
     fy = (height / 2) / np.tan(vfov / 2)
     x_cam = (np.arange(width) - width / 2) / fx
     y_cam = (np.arange(height) - height / 2) / fy
-    bh_y_cam, bh_x_cam = _psi_to_cam_offset(psi)
-    x_cam = x_cam - bh_x_cam
-    y_cam = y_cam - bh_y_cam
-    theta_pixel = np.arctan2(x_cam[None, :], y_cam[:, None])
-    x_cam_abs_max = max(float(np.max(np.abs(x_cam))), 1e-12)
-    axis_refine_cols = np.abs(x_cam) <= (Y_AXIS_REFINE_FRAC * x_cam_abs_max)
+    d, e_x, e_y, in_front = _psi_frame(psi)
+    if not in_front:
+        raise ValueError("psi points the black hole behind the camera (z <= 0)")
+
+    denom = np.sqrt(1.0 + x_cam[None, :]**2 + y_cam[:, None]**2)
+    vx = x_cam[None, :] / denom
+    vy = y_cam[:, None] / denom
+    vz = 1.0 / denom
+    theta_pixel = np.arctan2(
+        vx * e_x[0] + vy * e_x[1] + vz * e_x[2],
+        vx * e_y[0] + vy * e_y[1] + vz * e_y[2],
+    )
+
+    bh_y_cam, bh_x_cam, _ = _psi_to_cam_projection(psi)
+    x_rel = x_cam - bh_x_cam
+    x_cam_abs_max = max(float(np.max(np.abs(x_rel))), 1e-12)
+    axis_refine_cols = np.abs(x_rel) <= (Y_AXIS_REFINE_FRAC * x_cam_abs_max)
 
     use_tb_symmetry = (np.isclose(theta_obs, np.pi / 2)
                        and np.isclose(psi[0], 0.0))
@@ -302,10 +373,18 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
     fy = (height / 2) / np.tan(vertical_fov / 2)
     x_cam = (np.arange(width) - width / 2) / fx
     y_cam = (np.arange(height) - height / 2) / fy
-    bh_y_cam, bh_x_cam = _psi_to_cam_offset(psi)
-    x_cam = x_cam - bh_x_cam
-    y_cam = y_cam - bh_y_cam
-    theta_lookup = np.arctan2(x_cam[None, :], y_cam[:, None])
+    d, e_x, e_y, in_front = _psi_frame(psi)
+    if not in_front:
+        raise ValueError("psi points the black hole behind the camera (z <= 0)")
+
+    denom = np.sqrt(1.0 + x_cam[None, :]**2 + y_cam[:, None]**2)
+    vx = x_cam[None, :] / denom
+    vy = y_cam[:, None] / denom
+    vz = 1.0 / denom
+    theta_lookup = np.arctan2(
+        vx * e_x[0] + vy * e_x[1] + vz * e_x[2],
+        vx * e_y[0] + vy * e_y[1] + vz * e_y[2],
+    )
 
     valid = alpha_lookup >= alpha_crit
 
@@ -332,18 +411,40 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
         fa = final_alpha_lookup[escaped].astype(np.float64)
         th = theta_lookup[escaped]
 
-        r_cam = np.tan(fa)
-        src_x_cam = r_cam * np.sin(th) + bh_x_cam
-        src_y_cam = r_cam * np.cos(th) + bh_y_cam
-        src_x = np.rint(src_x_cam * fx + width / 2).astype(np.intp)
-        src_y = np.rint(src_y_cam * fy + height / 2).astype(np.intp)
+        sin_fa = np.sin(fa)
+        cos_fa = np.cos(fa)
+        src_vx = (cos_fa * d[0]
+                  + sin_fa * (np.sin(th) * e_x[0] + np.cos(th) * e_y[0]))
+        src_vy = (cos_fa * d[1]
+                  + sin_fa * (np.sin(th) * e_x[1] + np.cos(th) * e_y[1]))
+        src_vz = (cos_fa * d[2]
+                  + sin_fa * (np.sin(th) * e_x[2] + np.cos(th) * e_y[2]))
 
         if render_loop_around:
+            # Keep legacy "wrap" behavior only for the front-facing branch.
+            src_x_cam = np.zeros_like(src_vx)
+            src_y_cam = np.zeros_like(src_vy)
+            front = src_vz > 1e-12
+            src_x_cam[front] = src_vx[front] / src_vz[front]
+            src_y_cam[front] = src_vy[front] / src_vz[front]
+            src_x = np.rint(src_x_cam * fx + width / 2).astype(np.intp)
+            src_y = np.rint(src_y_cam * fy + height / 2).astype(np.intp)
             src_y %= height
             src_x %= width
             lensed[escaped] = source_image[src_y, src_x]
         else:
-            in_bounds = ((src_y >= 0) & (src_y < height)
+            front = src_vz > 1e-12
+            src_x_cam = np.empty_like(src_vx)
+            src_y_cam = np.empty_like(src_vy)
+            src_x_cam[front] = src_vx[front] / src_vz[front]
+            src_y_cam[front] = src_vy[front] / src_vz[front]
+            src_x = np.empty_like(src_vx, dtype=np.intp)
+            src_y = np.empty_like(src_vy, dtype=np.intp)
+            src_x[front] = np.rint(src_x_cam[front] * fx + width / 2).astype(np.intp)
+            src_y[front] = np.rint(src_y_cam[front] * fy + height / 2).astype(np.intp)
+
+            in_bounds = (front
+                         & (src_y >= 0) & (src_y < height)
                          & (src_x >= 0) & (src_x < width))
 
             if source_image.ndim == 3:
@@ -431,12 +532,34 @@ def main(metric=None, M=1.0, a=0.0, r_obs_mult=100.0,
     horizontal_fov = 2 * np.arctan(np.tan(vertical_fov / 2) * width / height)
     fov = (horizontal_fov, vertical_fov)
     psi_y, psi_x = psi
-    bh_in_fov = (abs(psi_y) <= vertical_fov / 2
-                 and abs(psi_x) <= horizontal_fov / 2)
+    bh_y_cam, bh_x_cam, bh_in_front = _psi_to_cam_projection(psi)
+    bh_in_fov = (bh_in_front
+                 and abs(bh_y_cam) <= np.tan(vertical_fov / 2)
+                 and abs(bh_x_cam) <= np.tan(horizontal_fov / 2))
+    bh_pos_status = ("behind observer" if not bh_in_front
+                     else ("inside FOV" if bh_in_fov else "outside FOV"))
     print("BH screen offset: "
           f"psi_y={np.degrees(psi_y):.4f} deg, "
           f"psi_x={np.degrees(psi_x):.4f} deg "
-          f"({'inside' if bh_in_fov else 'outside'} FOV)")
+          f"({bh_pos_status})")
+
+    if not bh_in_front:
+        print("BH lies behind the camera for this psi; "
+              "forward-view pinhole rendering will show the unlensed image.")
+        lensed_image = img.copy()
+        timings["build_lookup"] = 0.0
+        timings["precompute"] = 0.0
+        timings["render"] = 0.0
+        stage_start = perf_counter()
+        mpimg.imsave('lensed_image.png', lensed_image)
+        timings["save_image"] = perf_counter() - stage_start
+        timings["total"] = perf_counter() - total_start
+        total_rays = 0
+        traced_rays = 0
+        if debug_benchmark:
+            print_benchmark_summary(
+                (height, width), alpha_crit, total_rays, traced_rays, timings)
+        return
 
     render_loop_around = False
     if metric.is_spherically_symmetric:
