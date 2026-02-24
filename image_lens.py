@@ -83,9 +83,7 @@ def pixel_to_angles(pixel, image_dimension, fov, psi=(0.0, 0.0)):
     x_cam = x / fx
     y_cam = y / fy
 
-    d, e_x, e_y, in_front = _psi_frame(psi)
-    if not in_front:
-        raise ValueError("psi points the black hole behind the camera (z <= 0)")
+    d, e_x, e_y, _ = _psi_frame(psi)
 
     ray = np.array([x_cam, y_cam, 1.0], dtype=np.float64)
     ray /= np.linalg.norm(ray)
@@ -104,9 +102,7 @@ def angles_to_pixel(angles, image_dimension, fov, clip=False, psi=(0.0, 0.0)):
     fx = (width / 2) / np.tan(horizontal_fov / 2)
     fy = (height / 2) / np.tan(vertical_fov / 2)
 
-    d, e_x, e_y, in_front = _psi_frame(psi)
-    if not in_front:
-        raise ValueError("psi points the black hole behind the camera (z <= 0)")
+    d, e_x, e_y, _ = _psi_frame(psi)
 
     ray = (np.cos(alpha) * d
            + np.sin(alpha) * (np.sin(theta) * e_x + np.cos(theta) * e_y))
@@ -145,9 +141,7 @@ def build_alpha_lookup(image_dimension, fov, decimals=None, psi=(0.0, 0.0)):
 
     x_cam = (np.arange(width) - width / 2) / fx
     y_cam = (np.arange(height) - height / 2) / fy
-    d, _, _, in_front = _psi_frame(psi)
-    if not in_front:
-        raise ValueError("psi points the black hole behind the camera (z <= 0)")
+    d, _, _, _ = _psi_frame(psi)
 
     denom = np.sqrt(1.0 + x_cam[None, :]**2 + y_cam[:, None]**2)
     cos_alpha = ((x_cam[None, :] * d[0])
@@ -258,9 +252,7 @@ def precompute_final_alpha_lookup_2d(
     fy = (height / 2) / np.tan(vfov / 2)
     x_cam = (np.arange(width) - width / 2) / fx
     y_cam = (np.arange(height) - height / 2) / fy
-    d, e_x, e_y, in_front = _psi_frame(psi)
-    if not in_front:
-        raise ValueError("psi points the black hole behind the camera (z <= 0)")
+    d, e_x, e_y, _ = _psi_frame(psi)
 
     denom = np.sqrt(1.0 + x_cam[None, :]**2 + y_cam[:, None]**2)
     vx = x_cam[None, :] / denom
@@ -271,10 +263,13 @@ def precompute_final_alpha_lookup_2d(
         vx * e_y[0] + vy * e_y[1] + vz * e_y[2],
     )
 
-    bh_y_cam, bh_x_cam, _ = _psi_to_cam_projection(psi)
-    x_rel = x_cam - bh_x_cam
-    x_cam_abs_max = max(float(np.max(np.abs(x_rel))), 1e-12)
-    axis_refine_cols = np.abs(x_rel) <= (Y_AXIS_REFINE_FRAC * x_cam_abs_max)
+    _, bh_x_cam, bh_proj_front = _psi_to_cam_projection(psi)
+    if bh_proj_front:
+        x_rel = x_cam - bh_x_cam
+        x_cam_abs_max = max(float(np.max(np.abs(x_rel))), 1e-12)
+        axis_refine_cols = np.abs(x_rel) <= (Y_AXIS_REFINE_FRAC * x_cam_abs_max)
+    else:
+        axis_refine_cols = np.zeros_like(x_cam, dtype=bool)
 
     use_tb_symmetry = (np.isclose(theta_obs, np.pi / 2)
                        and np.isclose(psi[0], 0.0))
@@ -373,9 +368,7 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
     fy = (height / 2) / np.tan(vertical_fov / 2)
     x_cam = (np.arange(width) - width / 2) / fx
     y_cam = (np.arange(height) - height / 2) / fy
-    d, e_x, e_y, in_front = _psi_frame(psi)
-    if not in_front:
-        raise ValueError("psi points the black hole behind the camera (z <= 0)")
+    d, e_x, e_y, _ = _psi_frame(psi)
 
     denom = np.sqrt(1.0 + x_cam[None, :]**2 + y_cam[:, None]**2)
     vx = x_cam[None, :] / denom
@@ -542,24 +535,6 @@ def main(metric=None, M=1.0, a=0.0, r_obs_mult=100.0,
           f"psi_y={np.degrees(psi_y):.4f} deg, "
           f"psi_x={np.degrees(psi_x):.4f} deg "
           f"({bh_pos_status})")
-
-    if not bh_in_front:
-        print("BH lies behind the camera for this psi; "
-              "forward-view pinhole rendering will show the unlensed image.")
-        lensed_image = img.copy()
-        timings["build_lookup"] = 0.0
-        timings["precompute"] = 0.0
-        timings["render"] = 0.0
-        stage_start = perf_counter()
-        mpimg.imsave('lensed_image.png', lensed_image)
-        timings["save_image"] = perf_counter() - stage_start
-        timings["total"] = perf_counter() - total_start
-        total_rays = 0
-        traced_rays = 0
-        if debug_benchmark:
-            print_benchmark_summary(
-                (height, width), alpha_crit, total_rays, traced_rays, timings)
-        return
 
     render_loop_around = False
     if metric.is_spherically_symmetric:
