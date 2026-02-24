@@ -397,7 +397,7 @@ def print_benchmark_summary(image_dimension, alpha_crit, total_rays,
 # Main
 # ============================================================================
 
-def main(metric=None, M=1.0, a=0.0, psi=(0.0, 0.0)):
+def main(metric=None, M=1.0, a=0.0, psi=(0.0, 0.0), vertical_fov_deg=40.0):
     if metric is None:
         if a == 0:
             metric = Schwarzschild(M=M)
@@ -426,7 +426,6 @@ def main(metric=None, M=1.0, a=0.0, psi=(0.0, 0.0)):
     alpha_crit = metric.alpha_crit(r_obs)
     print(f"r_obs = {r_obs:.1f} M, alpha_crit = {np.degrees(alpha_crit):.4f} deg")
 
-    vertical_fov_deg = 40.0
     vertical_fov = np.radians(vertical_fov_deg)
     horizontal_fov = 2 * np.arctan(np.tan(vertical_fov / 2) * width / height)
     fov = (horizontal_fov, vertical_fov)
@@ -491,6 +490,9 @@ if __name__ == "__main__":
                         help="BH vertical offset in deg (+ = top, - = bottom)")
     parser.add_argument("--psi-x", type=float, default=0.0,
                         help="BH horizontal offset in deg (+ = right, - = left)")
+    parser.add_argument("--fov-v", type=float, default=40.0,
+                        help="Vertical field of view in deg")
     args = parser.parse_args()
     main(M=args.M, a=args.a,
-         psi=(np.radians(args.psi_y), np.radians(args.psi_x)))
+         psi=(np.radians(args.psi_y), np.radians(args.psi_x)),
+         vertical_fov_deg=args.fov_v)
