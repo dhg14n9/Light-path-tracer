@@ -19,7 +19,14 @@ Y_AXIS_REFINE_FRAC = 0.07
 # Pixel <-> angle conversions
 # ============================================================================
 
-def pixel_to_angles(pixel, image_dimension, fov):
+def _psi_to_cam_offset(psi):
+    """Convert BH screen offset psi=(psi_y, psi_x) [rad] to camera-plane offset."""
+    psi_y, psi_x = psi
+    # Image y grows downward, but psi_y > 0 means "move BH upward".
+    return (-np.tan(psi_y), np.tan(psi_x))
+
+
+def pixel_to_angles(pixel, image_dimension, fov, psi=(0.0, 0.0)):
     height, width = image_dimension
     horizontal_fov, vertical_fov = fov
 
@@ -31,13 +38,16 @@ def pixel_to_angles(pixel, image_dimension, fov):
 
     x_cam = x / fx
     y_cam = y / fy
+    bh_y_cam, bh_x_cam = _psi_to_cam_offset(psi)
+    x_cam -= bh_x_cam
+    y_cam -= bh_y_cam
 
     alpha = np.arctan2(np.sqrt(x_cam**2 + y_cam**2), 1.0)
     theta = np.arctan2(x_cam, y_cam)
     return (alpha, theta)
 
 
-def angles_to_pixel(angles, image_dimension, fov, clip=False):
+def angles_to_pixel(angles, image_dimension, fov, clip=False, psi=(0.0, 0.0)):
     alpha, theta = angles
     height, width = image_dimension
     horizontal_fov, vertical_fov = fov
@@ -48,6 +58,9 @@ def angles_to_pixel(angles, image_dimension, fov, clip=False):
     r_cam = np.tan(alpha)
     x_cam = r_cam * np.sin(theta)
     y_cam = r_cam * np.cos(theta)
+    bh_y_cam, bh_x_cam = _psi_to_cam_offset(psi)
+    x_cam += bh_x_cam
+    y_cam += bh_y_cam
 
     x = x_cam * fx
     y = y_cam * fy
@@ -66,7 +79,7 @@ def angles_to_pixel(angles, image_dimension, fov, clip=False):
 # Alpha lookup (1D, for spherically symmetric metrics)
 # ============================================================================
 
-def build_alpha_lookup(image_dimension, fov, decimals=None):
+def build_alpha_lookup(image_dimension, fov, decimals=None, psi=(0.0, 0.0)):
     """Build a per-pixel alpha lookup table (vectorized)."""
     height, width = image_dimension
     horizontal_fov, vertical_fov = fov
@@ -76,6 +89,9 @@ def build_alpha_lookup(image_dimension, fov, decimals=None):
 
     x_cam = (np.arange(width) - width / 2) / fx
     y_cam = (np.arange(height) - height / 2) / fy
+    bh_y_cam, bh_x_cam = _psi_to_cam_offset(psi)
+    x_cam = x_cam - bh_x_cam
+    y_cam = y_cam - bh_y_cam
 
     alpha = np.arctan2(np.hypot(x_cam[None, :], y_cam[:, None]), 1.0)
     if decimals is not None:
@@ -170,7 +186,7 @@ def precompute_final_alpha_lookup(
 
 def precompute_final_alpha_lookup_2d(
     alpha_lookup, fov, alpha_crit, r_obs, metric,
-    theta_obs=np.pi / 2, num_worker=None,
+    theta_obs=np.pi / 2, num_worker=None, psi=(0.0, 0.0),
 ):
     """Trace one ray per pixel for non-spherically-symmetric metrics."""
     shape = alpha_lookup.shape
@@ -182,11 +198,15 @@ def precompute_final_alpha_lookup_2d(
     fy = (height / 2) / np.tan(vfov / 2)
     x_cam = (np.arange(width) - width / 2) / fx
     y_cam = (np.arange(height) - height / 2) / fy
+    bh_y_cam, bh_x_cam = _psi_to_cam_offset(psi)
+    x_cam = x_cam - bh_x_cam
+    y_cam = y_cam - bh_y_cam
     theta_pixel = np.arctan2(x_cam[None, :], y_cam[:, None])
     x_cam_abs_max = max(float(np.max(np.abs(x_cam))), 1e-12)
     axis_refine_cols = np.abs(x_cam) <= (Y_AXIS_REFINE_FRAC * x_cam_abs_max)
 
-    use_tb_symmetry = np.isclose(theta_obs, np.pi / 2)
+    use_tb_symmetry = (np.isclose(theta_obs, np.pi / 2)
+                       and np.isclose(psi[0], 0.0))
     trace_rows = (height + 1) // 2 if use_tb_symmetry else height
 
     alpha_trace = alpha_lookup[:trace_rows, :]
@@ -272,7 +292,7 @@ WINDING_COLORS = np.array([
 
 def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
                         winding_lookup, alpha_crit, fov,
-                        render_loop_around=False):
+                        render_loop_around=False, psi=(0.0, 0.0)):
     """Render the output image using precomputed alpha lookup tables."""
     height, width = source_image.shape[:2]
     horizontal_fov, vertical_fov = fov
@@ -282,6 +302,9 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
     fy = (height / 2) / np.tan(vertical_fov / 2)
     x_cam = (np.arange(width) - width / 2) / fx
     y_cam = (np.arange(height) - height / 2) / fy
+    bh_y_cam, bh_x_cam = _psi_to_cam_offset(psi)
+    x_cam = x_cam - bh_x_cam
+    y_cam = y_cam - bh_y_cam
     theta_lookup = np.arctan2(x_cam[None, :], y_cam[:, None])
 
     valid = alpha_lookup >= alpha_crit
@@ -310,8 +333,10 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
         th = theta_lookup[escaped]
 
         r_cam = np.tan(fa)
-        src_x = np.rint(r_cam * np.sin(th) * fx + width / 2).astype(np.intp)
-        src_y = np.rint(r_cam * np.cos(th) * fy + height / 2).astype(np.intp)
+        src_x_cam = r_cam * np.sin(th) + bh_x_cam
+        src_y_cam = r_cam * np.cos(th) + bh_y_cam
+        src_x = np.rint(src_x_cam * fx + width / 2).astype(np.intp)
+        src_y = np.rint(src_y_cam * fy + height / 2).astype(np.intp)
 
         if render_loop_around:
             src_y %= height
@@ -372,7 +397,7 @@ def print_benchmark_summary(image_dimension, alpha_crit, total_rays,
 # Main
 # ============================================================================
 
-def main(metric=None, M=1.0, a=0.0):
+def main(metric=None, M=1.0, a=0.0, psi=(0.0, 0.0)):
     if metric is None:
         if a == 0:
             metric = Schwarzschild(M=M)
@@ -405,12 +430,19 @@ def main(metric=None, M=1.0, a=0.0):
     vertical_fov = np.radians(vertical_fov_deg)
     horizontal_fov = 2 * np.arctan(np.tan(vertical_fov / 2) * width / height)
     fov = (horizontal_fov, vertical_fov)
+    psi_y, psi_x = psi
+    bh_in_fov = (abs(psi_y) <= vertical_fov / 2
+                 and abs(psi_x) <= horizontal_fov / 2)
+    print("BH screen offset: "
+          f"psi_y={np.degrees(psi_y):.4f} deg, "
+          f"psi_x={np.degrees(psi_x):.4f} deg "
+          f"({'inside' if bh_in_fov else 'outside'} FOV)")
 
     render_loop_around = False
     if metric.is_spherically_symmetric:
         print("Building per-pixel alpha lookup...")
         stage_start = perf_counter()
-        alpha_lookup = build_alpha_lookup((height, width), fov)
+        alpha_lookup = build_alpha_lookup((height, width), fov, psi=psi)
         timings["build_lookup"] = perf_counter() - stage_start
 
         stage_start = perf_counter()
@@ -421,20 +453,20 @@ def main(metric=None, M=1.0, a=0.0):
     else:
         print("Building per-pixel (alpha, theta) lookup...")
         stage_start = perf_counter()
-        alpha_lookup = build_alpha_lookup((height, width), fov)
+        alpha_lookup = build_alpha_lookup((height, width), fov, psi=psi)
         timings["build_lookup"] = perf_counter() - stage_start
 
         stage_start = perf_counter()
         (final_alpha_lookup, winding_lookup,
          total_rays, traced_rays) = precompute_final_alpha_lookup_2d(
-            alpha_lookup, fov, alpha_crit, r_obs, metric)
+            alpha_lookup, fov, alpha_crit, r_obs, metric, psi=psi)
         timings["precompute"] = perf_counter() - stage_start
 
     # Render
     stage_start = perf_counter()
     lensed_image = render_lensed_image(
         img, alpha_lookup, final_alpha_lookup, winding_lookup,
-        alpha_crit, fov, render_loop_around,
+        alpha_crit, fov, render_loop_around, psi=psi,
     )
     timings["render"] = perf_counter() - stage_start
 
@@ -455,5 +487,10 @@ if __name__ == "__main__":
     parser.add_argument("--M", type=float, default=1.0, help="BH mass")
     parser.add_argument("--a", type=float, default=0.0,
                         help="BH spin (|a| <= M, 0 = Schwarzschild)")
+    parser.add_argument("--psi-y", type=float, default=0.0,
+                        help="BH vertical offset in deg (+ = top, - = bottom)")
+    parser.add_argument("--psi-x", type=float, default=0.0,
+                        help="BH horizontal offset in deg (+ = right, - = left)")
     args = parser.parse_args()
-    main(M=args.M, a=args.a)
+    main(M=args.M, a=args.a,
+         psi=(np.radians(args.psi_y), np.radians(args.psi_x)))

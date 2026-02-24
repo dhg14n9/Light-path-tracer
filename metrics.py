@@ -150,7 +150,10 @@ def _kerr_initial_conditions_numba(M, a, r_obs, alpha, theta, theta_obs):
     L = xi * E
     Q = eta * E * E
 
-    p_t = E
+    # Covariant canonical momentum convention: p_t = -E (E > 0 for
+    # future-directed null geodesics). This must match the Hamiltonian
+    # evolution using g^{mu nu} p_mu p_nu.
+    p_t = -E
     p_phi = L
 
     Theta = Q - cos_th * cos_th * (L * L / sin_th_sq - a * a * E * E)
@@ -816,7 +819,10 @@ class Kerr(Metric):
         L = xi * E
         Q = eta * E**2
 
-        p_t = E
+        # Covariant canonical momentum convention: p_t = -E (E > 0).
+        # Using p_t = +E flips the g^{t phi} cross-term physics and
+        # effectively reverses frame-dragging behavior.
+        p_t = -E
         p_phi = L
 
         # p_theta from Carter constant:
