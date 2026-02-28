@@ -5,7 +5,6 @@ import numpy as np
 import matplotlib.image as mpimg
 from tqdm import tqdm
 from time import perf_counter
-from concurrent.futures import ProcessPoolExecutor
 
 from metrics import Schwarzschild, Kerr
 
@@ -196,42 +195,28 @@ def precompute_final_alpha_lookup(
     num_worker=None,
 ):
     """Trace one ray per pixel (1D alpha-only, spherically symmetric)."""
-    alpha_flat = alpha_lookup.ravel()
-    valid_indices = np.arange(alpha_flat.size, dtype=np.intp)
+    alpha_flat = alpha_lookup.ravel().astype(np.float64)
+    n = alpha_flat.size
 
-    final_alpha_flat = np.full(alpha_flat.shape, np.nan, dtype=np.float32)
-    winding_flat = np.zeros(alpha_flat.shape, dtype=WINDING_DTYPE)
+    final_alpha_flat = np.full(n, np.nan, dtype=np.float64)
+    winding_flat = np.zeros(n, dtype=np.int64)
 
-    if valid_indices.size == 0:
-        return (final_alpha_flat.reshape(alpha_lookup.shape),
-                winding_flat.reshape(alpha_lookup.shape),
-                int(alpha_flat.size), 0)
+    if n == 0:
+        return (np.full(alpha_lookup.shape, np.nan, dtype=np.float32),
+                np.zeros(alpha_lookup.shape, dtype=WINDING_DTYPE),
+                n, 0)
 
-    metric_kwargs = {'M': metric.M}
-    if hasattr(metric, 'a'):
-        metric_kwargs['a'] = metric.a
+    chunk = 50_000
+    for start in tqdm(range(0, n, chunk), desc="Tracing per-pixel rays",
+                      unit="chunk"):
+        end = min(start + chunk, n)
+        metric.trace_rays_batch(
+            r_obs, alpha_flat[start:end],
+            final_alpha_flat[start:end], winding_flat[start:end])
 
-    with ProcessPoolExecutor(
-        max_workers=num_worker,
-        initializer=_init_worker,
-        initargs=(type(metric).__name__, metric_kwargs),
-    ) as executor:
-        task_iter = (
-            (int(idx), float(alpha_flat[idx]), r_obs)
-            for idx in valid_indices
-        )
-        for idx, final_alpha, n_half_orbits in tqdm(
-            executor.map(_trace_single_alpha, task_iter, chunksize=256),
-            total=int(valid_indices.size),
-            desc="Tracing per-pixel rays",
-            unit="ray",
-        ):
-            final_alpha_flat[idx] = final_alpha
-            winding_flat[idx] = min(int(n_half_orbits), WINDING_MAX)
-
-    return (final_alpha_flat.reshape(alpha_lookup.shape),
-            winding_flat.reshape(alpha_lookup.shape),
-            int(alpha_flat.size), int(valid_indices.size))
+    fa_out = final_alpha_flat.astype(np.float32).reshape(alpha_lookup.shape)
+    w_out = np.clip(winding_flat, 0, WINDING_MAX).astype(WINDING_DTYPE).reshape(alpha_lookup.shape)
+    return fa_out, w_out, n, n
 
 
 # ============================================================================
@@ -297,31 +282,24 @@ def precompute_final_alpha_lookup_2d(
               f"({alpha_lookup.size:,} pixels total)")
 
     if valid_indices.size:
-        metric_kwargs = {'M': metric.M}
-        if hasattr(metric, 'a'):
-            metric_kwargs['a'] = metric.a
+        alpha_f64 = alpha_trace_flat.astype(np.float64)
+        theta_f64 = theta_trace_flat.astype(np.float64)
+        axis_f64 = axis_refine_trace_flat.astype(np.bool_)
 
-        with ProcessPoolExecutor(
-            max_workers=num_worker,
-            initializer=_init_worker,
-            initargs=(type(metric).__name__, metric_kwargs),
-        ) as executor:
-            task_iter = (
-                (int(idx), float(alpha_trace_flat[idx]),
-                 float(theta_trace_flat[idx]),
-                 r_obs, theta_obs,
-                 bool(axis_refine_trace_flat[idx]))
-                for idx in valid_indices
-            )
-            for idx, final_alpha, n_half_orbits in tqdm(
-                executor.map(_trace_single_alpha_theta, task_iter,
-                             chunksize=256),
-                total=int(valid_indices.size),
-                desc="Tracing per-pixel rays",
-                unit="ray",
-            ):
-                final_alpha_trace_flat[idx] = final_alpha
-                winding_trace_flat[idx] = min(int(n_half_orbits), WINDING_MAX)
+        fa_buf = np.full(alpha_f64.size, np.nan, dtype=np.float64)
+        w_buf = np.zeros(alpha_f64.size, dtype=np.int64)
+
+        chunk = 50_000
+        for start in tqdm(range(0, alpha_f64.size, chunk),
+                          desc="Tracing per-pixel rays", unit="chunk"):
+            end = min(start + chunk, alpha_f64.size)
+            metric.trace_rays_batch(
+                r_obs, alpha_f64[start:end], theta_f64[start:end],
+                theta_obs, axis_f64[start:end],
+                fa_buf[start:end], w_buf[start:end])
+
+        final_alpha_trace_flat[:] = fa_buf.astype(np.float32)
+        winding_trace_flat[:] = np.clip(w_buf, 0, WINDING_MAX).astype(WINDING_DTYPE)
 
     final_alpha_out = np.full(shape, np.nan, dtype=np.float32)
     winding_out = np.zeros(shape, dtype=WINDING_DTYPE)
@@ -379,7 +357,7 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
         vx * e_y[0] + vy * e_y[1] + vz * e_y[2],
     )
 
-    valid = alpha_lookup >= alpha_crit
+    valid = np.isfinite(final_alpha_lookup)
 
     # Winding: escaped rays that turned past pi/2
     winding = valid & (final_alpha_lookup > np.pi / 2)

@@ -4,7 +4,9 @@ Pluggable spacetime metrics for the geodesic tracer.
 Each metric encapsulates all metric-specific physics: geodesic equations,
 initial conditions, ray tracing, and critical angles.
 
-Uniform 8D state vector: [t, r, theta, phi, p_t, p_r, p_theta, p_phi].
+Public 8D state vector: [t, r, theta, phi, p_t, p_r, p_theta, p_phi].
+Internal Kerr integrators use a reduced 5D state [r, theta, phi, p_r, p_theta]
+with conserved p_t and p_phi passed as separate scalars.
 """
 
 from abc import ABC, abstractmethod
@@ -12,10 +14,11 @@ from abc import ABC, abstractmethod
 import numpy as np
 
 try:
-    from numba import njit
+    from numba import njit, prange
     NUMBA_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency
     NUMBA_AVAILABLE = False
+    prange = range
 
     def njit(*args, **kwargs):
         if args and callable(args[0]) and len(args) == 1 and not kwargs:
@@ -115,8 +118,36 @@ def _schwarzschild_trace_orbit_numba(M, R_S, r_obs, alpha, phi_max, h_max):
 
 
 @njit(cache=True)
+def _schwarzschild_trace_ray_numba(M, R_S, r_obs, alpha, phi_max, h_max):
+    """Trace a Schwarzschild ray: orbit integration + angle extraction.
+
+    Returns (status, final_alpha, n_half_orbits) matching the Kerr signature.
+    status: 1 escaped, -1 captured, 0 invalid.
+    """
+    status, phi_f, u_f, w_f = _schwarzschild_trace_orbit_numba(
+        M, R_S, r_obs, alpha, phi_max, h_max)
+    if status == 0:
+        return 0, np.nan, 0
+
+    r_f = 1.0 / u_f
+    n_half_orbits = int(np.abs(phi_f) // np.pi)
+    if status == -1 or r_f <= R_S * 1.1:
+        return -1, np.nan, n_half_orbits
+
+    dr_dphi = -w_f / (u_f * u_f)
+    sin_phi = np.sin(phi_f)
+    cos_phi = np.cos(phi_f)
+    heading = np.arctan2(
+        dr_dphi * sin_phi + r_f * cos_phi,
+        dr_dphi * cos_phi - r_f * sin_phi,
+    )
+    final_alpha = np.arccos(_clip_scalar(-np.cos(heading), -1.0, 1.0))
+    return 1, final_alpha, n_half_orbits
+
+
+@njit(cache=True)
 def _kerr_initial_conditions_numba(M, a, r_obs, alpha, theta, theta_obs):
-    state = np.empty(8, dtype=np.float64)
+    state = np.empty(5, dtype=np.float64)
 
     r = r_obs
     th = theta_obs
@@ -129,7 +160,7 @@ def _kerr_initial_conditions_numba(M, a, r_obs, alpha, theta, theta_obs):
     Sigma = r * r + a * a * cos_th * cos_th
     Delta = r * r - 2.0 * M * r + a * a
     if Delta <= 0.0 or Sigma <= 0.0:
-        return False, state
+        return False, state, 0.0, 0.0
 
     sin_alpha = np.sin(alpha)
     sin_screen = np.sin(theta)
@@ -178,24 +209,25 @@ def _kerr_initial_conditions_numba(M, a, r_obs, alpha, theta, theta_obs):
         p_r_sq = 0.0
     p_r = -np.sqrt(p_r_sq)
 
-    state[0] = 0.0
-    state[1] = r
-    state[2] = th
-    state[3] = 0.0
-    state[4] = p_t
-    state[5] = p_r
-    state[6] = p_theta
-    state[7] = p_phi
-    return True, state
+    # 5D state: [r, θ, φ, p_r, p_θ]
+    state[0] = r
+    state[1] = th
+    state[2] = 0.0
+    state[3] = p_r
+    state[4] = p_theta
+    return True, state, p_t, p_phi
 
 
 @njit(cache=True)
-def _kerr_geodesic_equations_numba(state, M, a, r_plus, out):
-    t, r, th, phi, p_t, p_r, p_th, p_phi = state
+def _kerr_geodesic_equations_numba(state5, p_t, p_phi, M, a, r_plus, out5):
+    r = state5[0]
+    th = state5[1]
+    p_r = state5[3]
+    p_th = state5[4]
 
     if r <= r_plus * 1.001:
-        for i in range(8):
-            out[i] = 0.0
+        for i in range(5):
+            out5[i] = 0.0
         return
 
     sin_th = np.sin(th)
@@ -208,13 +240,11 @@ def _kerr_geodesic_equations_numba(state, M, a, r_plus, out):
     Delta = r * r - 2.0 * M * r + a * a
     A = (r * r + a * a) * (r * r + a * a) - a * a * Delta * sin_th_sq
 
-    g_tt_inv = -A / (Sigma * Delta)
     g_tphi_inv = -2.0 * M * a * r / (Sigma * Delta)
     g_rr_inv = Delta / Sigma
     g_thth_inv = 1.0 / Sigma
     g_phiphi_inv = (Delta - a * a * sin_th_sq) / (Sigma * Delta * sin_th_sq)
 
-    dt = g_tt_inv * p_t + g_tphi_inv * p_phi
     dr = g_rr_inv * p_r
     dth = g_thth_inv * p_th
     dphi = g_tphi_inv * p_t + g_phiphi_inv * p_phi
@@ -266,32 +296,30 @@ def _kerr_geodesic_equations_numba(state, M, a, r_plus, out):
                     + dg_thth_inv_dth * p_th * p_th
                     + dg_phiphi_inv_dth * p_phi * p_phi)
 
-    out[0] = dt
-    out[1] = dr
-    out[2] = dth
-    out[3] = dphi
-    out[4] = 0.0
-    out[5] = dp_r
-    out[6] = dp_th
-    out[7] = 0.0
+    out5[0] = dr
+    out5[1] = dth
+    out5[2] = dphi
+    out5[3] = dp_r
+    out5[4] = dp_th
 
 
 @njit(cache=True)
-def _rk4_step_kerr_numba(state, h, M, a, r_plus, k1, k2, k3, k4, tmp, out_state):
-    _kerr_geodesic_equations_numba(state, M, a, r_plus, k1)
-    for i in range(8):
+def _rk4_step_kerr_numba(state, h, p_t, p_phi, M, a, r_plus,
+                          k1, k2, k3, k4, tmp, out_state):
+    _kerr_geodesic_equations_numba(state, p_t, p_phi, M, a, r_plus, k1)
+    for i in range(5):
         tmp[i] = state[i] + 0.5 * h * k1[i]
 
-    _kerr_geodesic_equations_numba(tmp, M, a, r_plus, k2)
-    for i in range(8):
+    _kerr_geodesic_equations_numba(tmp, p_t, p_phi, M, a, r_plus, k2)
+    for i in range(5):
         tmp[i] = state[i] + 0.5 * h * k2[i]
 
-    _kerr_geodesic_equations_numba(tmp, M, a, r_plus, k3)
-    for i in range(8):
+    _kerr_geodesic_equations_numba(tmp, p_t, p_phi, M, a, r_plus, k3)
+    for i in range(5):
         tmp[i] = state[i] + h * k3[i]
 
-    _kerr_geodesic_equations_numba(tmp, M, a, r_plus, k4)
-    for i in range(8):
+    _kerr_geodesic_equations_numba(tmp, p_t, p_phi, M, a, r_plus, k4)
+    for i in range(5):
         out_state[i] = state[i] + (h / 6.0) * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i])
 
 
@@ -304,21 +332,262 @@ def _all_finite8(x):
 
 
 @njit(cache=True)
+def _all_finite5(x):
+    for i in range(5):
+        if not np.isfinite(x[i]):
+            return False
+    return True
+
+
+# -- Dormand-Prince 4(5) coefficients -----------------------------------------
+_DP_A21 = 1.0 / 5.0
+_DP_A31 = 3.0 / 40.0
+_DP_A32 = 9.0 / 40.0
+_DP_A41 = 44.0 / 45.0
+_DP_A42 = -56.0 / 15.0
+_DP_A43 = 32.0 / 9.0
+_DP_A51 = 19372.0 / 6561.0
+_DP_A52 = -25360.0 / 2187.0
+_DP_A53 = 64448.0 / 6561.0
+_DP_A54 = -212.0 / 729.0
+_DP_A61 = 9017.0 / 3168.0
+_DP_A62 = -355.0 / 33.0
+_DP_A63 = 46732.0 / 5247.0
+_DP_A64 = 49.0 / 176.0
+_DP_A65 = -5103.0 / 18656.0
+_DP_B1 = 35.0 / 384.0
+_DP_B3 = 500.0 / 1113.0
+_DP_B4 = 125.0 / 192.0
+_DP_B5 = -2187.0 / 6784.0
+_DP_B6 = 11.0 / 84.0
+_DP_E1 = 71.0 / 57600.0
+_DP_E3 = -71.0 / 16695.0
+_DP_E4 = 71.0 / 1920.0
+_DP_E5 = -17253.0 / 339200.0
+_DP_E6 = 22.0 / 525.0
+_DP_E7 = -1.0 / 40.0
+
+
+@njit(cache=True)
 def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
                           lambda_max, h_max, axis_refine):
-    ok, state = _kerr_initial_conditions_numba(M, a, r_obs, alpha, theta, theta_obs)
+    """Trace a Kerr ray using Dormand-Prince 4(5) adaptive integrator."""
+    ok, state, p_t, p_phi = _kerr_initial_conditions_numba(
+        M, a, r_obs, alpha, theta, theta_obs)
     if not ok:
         return 0, np.nan, 0
 
     r_capture = r_plus * 1.01
     r_escape = r_obs * 2.0
 
-    k1 = np.empty(8, dtype=np.float64)
-    k2 = np.empty(8, dtype=np.float64)
-    k3 = np.empty(8, dtype=np.float64)
-    k4 = np.empty(8, dtype=np.float64)
-    tmp = np.empty(8, dtype=np.float64)
-    next_state = np.empty(8, dtype=np.float64)
+    atol = 1e-10 if axis_refine else 1e-8
+    rtol = 1e-8 if axis_refine else 1e-6
+
+    # Working arrays: 7 stages (FSAL) + scratch — 5D
+    k1 = np.empty(5, dtype=np.float64)
+    k2 = np.empty(5, dtype=np.float64)
+    k3 = np.empty(5, dtype=np.float64)
+    k4 = np.empty(5, dtype=np.float64)
+    k5 = np.empty(5, dtype=np.float64)
+    k6 = np.empty(5, dtype=np.float64)
+    k7 = np.empty(5, dtype=np.float64)
+    tmp = np.empty(5, dtype=np.float64)
+    next_state = np.empty(5, dtype=np.float64)
+
+    # Initial RHS (seed for FSAL)
+    _kerr_geodesic_equations_numba(state, p_t, p_phi, M, a, r_plus, k1)
+
+    lam = 0.0
+    h = max(1.0, 0.01 * r_obs)
+    h_min = 1e-12
+    event_status = 2  # 1 escaped, -1 captured, 2 max-range
+    max_steps = 200000
+
+    for _step in range(max_steps):
+        if lam >= lambda_max:
+            break
+
+        remaining = lambda_max - lam
+        if h > remaining:
+            h = remaining
+        if h <= 0.0:
+            break
+
+        # -- Dormand-Prince stages 2-6 (k1 already filled via FSAL) --
+        for i in range(5):
+            tmp[i] = state[i] + h * _DP_A21 * k1[i]
+        _kerr_geodesic_equations_numba(tmp, p_t, p_phi, M, a, r_plus, k2)
+
+        for i in range(5):
+            tmp[i] = state[i] + h * (
+                _DP_A31 * k1[i] + _DP_A32 * k2[i])
+        _kerr_geodesic_equations_numba(tmp, p_t, p_phi, M, a, r_plus, k3)
+
+        for i in range(5):
+            tmp[i] = state[i] + h * (
+                _DP_A41 * k1[i] + _DP_A42 * k2[i] + _DP_A43 * k3[i])
+        _kerr_geodesic_equations_numba(tmp, p_t, p_phi, M, a, r_plus, k4)
+
+        for i in range(5):
+            tmp[i] = state[i] + h * (
+                _DP_A51 * k1[i] + _DP_A52 * k2[i]
+                + _DP_A53 * k3[i] + _DP_A54 * k4[i])
+        _kerr_geodesic_equations_numba(tmp, p_t, p_phi, M, a, r_plus, k5)
+
+        for i in range(5):
+            tmp[i] = state[i] + h * (
+                _DP_A61 * k1[i] + _DP_A62 * k2[i] + _DP_A63 * k3[i]
+                + _DP_A64 * k4[i] + _DP_A65 * k5[i])
+        _kerr_geodesic_equations_numba(tmp, p_t, p_phi, M, a, r_plus, k6)
+
+        # 5th-order solution
+        for i in range(5):
+            next_state[i] = state[i] + h * (
+                _DP_B1 * k1[i] + _DP_B3 * k3[i] + _DP_B4 * k4[i]
+                + _DP_B5 * k5[i] + _DP_B6 * k6[i])
+
+        # Stage 7 (FSAL: becomes k1 of next step on accept)
+        _kerr_geodesic_equations_numba(next_state, p_t, p_phi, M, a, r_plus, k7)
+
+        # Validity check: state[0] is r
+        if not (_all_finite5(next_state) and next_state[0] > 0.0):
+            h *= 0.25
+            if h < h_min:
+                return 0, np.nan, 0
+            continue
+
+        # Error norm over all 5 dynamical components
+        err_sq = 0.0
+        for idx in range(5):
+            ei = h * (_DP_E1 * k1[idx] + _DP_E3 * k3[idx]
+                      + _DP_E4 * k4[idx] + _DP_E5 * k5[idx]
+                      + _DP_E6 * k6[idx] + _DP_E7 * k7[idx])
+            sc = atol + rtol * max(abs(state[idx]), abs(next_state[idx]))
+            err_sq += (ei / sc) ** 2
+        err_norm = np.sqrt(err_sq / 5.0)
+
+        if err_norm > 1.0:
+            # Reject: shrink h, retry (k1 still valid)
+            factor = max(0.2, 0.9 * err_norm ** (-0.2))
+            h *= factor
+            if h < h_min:
+                return 0, np.nan, 0
+            continue
+
+        # -- Accept step --
+        r_prev = state[0]
+        r_next = next_state[0]
+
+        # Capture boundary
+        if r_prev > r_capture and r_next <= r_capture:
+            denom = r_next - r_prev
+            frac = 1.0 if denom == 0.0 else (r_capture - r_prev) / denom
+            frac = _clip_scalar(frac, 0.0, 1.0)
+            for i in range(5):
+                state[i] = state[i] + frac * (next_state[i] - state[i])
+            lam += frac * h
+            event_status = -1
+            break
+
+        # Escape boundary
+        if r_prev < r_escape and r_next >= r_escape:
+            denom = r_next - r_prev
+            frac = 1.0 if denom == 0.0 else (r_escape - r_prev) / denom
+            frac = _clip_scalar(frac, 0.0, 1.0)
+            for i in range(5):
+                state[i] = state[i] + frac * (next_state[i] - state[i])
+            lam += frac * h
+            event_status = 1
+            break
+
+        # Update state + FSAL
+        for i in range(5):
+            state[i] = next_state[i]
+        for i in range(5):
+            k1[i] = k7[i]
+        lam += h
+
+        if not _all_finite5(state):
+            return 0, np.nan, 0
+
+        # Grow h for next step
+        if err_norm < 1e-10:
+            h *= 5.0
+        else:
+            h *= min(5.0, 0.9 * err_norm ** (-0.2))
+
+    # -- Final angle extraction --
+    r_f = state[0]
+    th_f = state[1]
+    phi_f = state[2]
+    p_r_f = state[3]
+    p_th_f = state[4]
+
+    n_half_orbits = int(np.abs(phi_f) // np.pi)
+
+    if r_f <= r_capture * 1.1 or event_status == -1:
+        return -1, np.nan, n_half_orbits
+    if (not np.isfinite(r_f) or not np.isfinite(th_f)
+            or not np.isfinite(phi_f)):
+        return 0, np.nan, 0
+
+    sin_th = np.sin(th_f)
+    cos_th = np.cos(th_f)
+    sin_th_sq = sin_th * sin_th
+    if sin_th_sq < 1e-15:
+        sin_th_sq = 1e-15
+    Sigma_f = r_f * r_f + a * a * cos_th * cos_th
+    Delta_f = r_f * r_f - 2.0 * M * r_f + a * a
+    if Sigma_f <= 1e-15 or np.abs(Delta_f) <= 1e-15:
+        return 0, np.nan, n_half_orbits
+
+    dr_dl = Delta_f / Sigma_f * p_r_f
+    dth_dl = p_th_f / Sigma_f
+    dphi_dl = (-2.0 * M * a * r_f / (Sigma_f * Delta_f) * p_t
+               + (Delta_f - a * a * sin_th_sq)
+               / (Sigma_f * Delta_f * sin_th_sq) * p_phi)
+
+    sin_phi = np.sin(phi_f)
+    cos_phi = np.cos(phi_f)
+
+    vx = (sin_th * cos_phi * dr_dl
+          + r_f * cos_th * cos_phi * dth_dl
+          - r_f * sin_th * sin_phi * dphi_dl)
+    vy = (sin_th * sin_phi * dr_dl
+          + r_f * cos_th * sin_phi * dth_dl
+          + r_f * sin_th * cos_phi * dphi_dl)
+    vz = cos_th * dr_dl - r_f * sin_th * dth_dl
+
+    if (not np.isfinite(vx) or not np.isfinite(vy)
+            or not np.isfinite(vz)):
+        return 0, np.nan, n_half_orbits
+
+    v_mag = np.sqrt(vx * vx + vy * vy + vz * vz)
+    if v_mag < 1e-30:
+        return 1, np.nan, n_half_orbits
+
+    final_alpha = np.arccos(_clip_scalar(-vx / v_mag, -1.0, 1.0))
+    return 1, final_alpha, n_half_orbits
+
+
+@njit(cache=True)
+def _kerr_trace_ray_rk4_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
+                               lambda_max, h_max, axis_refine):
+    """Old fixed-step RK4 integrator (kept for comparison testing)."""
+    ok, state, p_t, p_phi = _kerr_initial_conditions_numba(
+        M, a, r_obs, alpha, theta, theta_obs)
+    if not ok:
+        return 0, np.nan, 0
+
+    r_capture = r_plus * 1.01
+    r_escape = r_obs * 2.0
+
+    k1 = np.empty(5, dtype=np.float64)
+    k2 = np.empty(5, dtype=np.float64)
+    k3 = np.empty(5, dtype=np.float64)
+    k4 = np.empty(5, dtype=np.float64)
+    tmp = np.empty(5, dtype=np.float64)
+    next_state = np.empty(5, dtype=np.float64)
 
     lam = 0.0
     event_status = 2  # 1 escaped, -1 captured, 2 max-range
@@ -336,7 +605,7 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
             break
 
         # Semi-adaptive stepping near the horizon / high-curvature region.
-        r_curr = state[1]
+        r_curr = state[0]
         if r_curr < r_capture * 4.0:
             h = min(h, 0.20 if axis_refine else 0.25)
         if r_curr < r_capture * 2.0:
@@ -344,16 +613,17 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
         if r_curr < r_capture * 1.2:
             h = min(h, 0.03 if axis_refine else 0.05)
 
-        r_prev = state[1]
+        r_prev = state[0]
         step_ok = False
 
         while True:
             _rk4_step_kerr_numba(
-                state, h, M, a, r_plus, k1, k2, k3, k4, tmp, next_state)
+                state, h, p_t, p_phi, M, a, r_plus,
+                k1, k2, k3, k4, tmp, next_state)
 
-            if (_all_finite8(next_state)
-                    and np.isfinite(next_state[1])
-                    and next_state[1] > 0.0):
+            if (_all_finite5(next_state)
+                    and np.isfinite(next_state[0])
+                    and next_state[0] > 0.0):
                 step_ok = True
                 break
 
@@ -362,13 +632,13 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
 
             h *= 0.5
 
-        r_next = next_state[1]
+        r_next = next_state[0]
 
         if r_prev > r_capture and r_next <= r_capture:
             denom = r_next - r_prev
             frac = 1.0 if denom == 0.0 else (r_capture - r_prev) / denom
             frac = _clip_scalar(frac, 0.0, 1.0)
-            for i in range(8):
+            for i in range(5):
                 state[i] = state[i] + frac * (next_state[i] - state[i])
             lam += frac * h
             event_status = -1
@@ -378,32 +648,31 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
             denom = r_next - r_prev
             frac = 1.0 if denom == 0.0 else (r_escape - r_prev) / denom
             frac = _clip_scalar(frac, 0.0, 1.0)
-            for i in range(8):
+            for i in range(5):
                 state[i] = state[i] + frac * (next_state[i] - state[i])
             lam += frac * h
             event_status = 1
             break
 
-        for i in range(8):
+        for i in range(5):
             state[i] = next_state[i]
         lam += h
 
-        if not _all_finite8(state):
+        if not _all_finite5(state):
             return 0, np.nan, 0
 
-    r_f = state[1]
-    th_f = state[2]
-    phi_f = state[3]
-    p_t_f = state[4]
-    p_r_f = state[5]
-    p_th_f = state[6]
-    p_phi_f = state[7]
+    r_f = state[0]
+    th_f = state[1]
+    phi_f = state[2]
+    p_r_f = state[3]
+    p_th_f = state[4]
 
     n_half_orbits = int(np.abs(phi_f) // np.pi)
 
     if r_f <= r_capture * 1.1 or event_status == -1:
         return -1, np.nan, n_half_orbits
-    if (not np.isfinite(r_f) or not np.isfinite(th_f) or not np.isfinite(phi_f)):
+    if (not np.isfinite(r_f) or not np.isfinite(th_f)
+            or not np.isfinite(phi_f)):
         return 0, np.nan, 0
 
     sin_th = np.sin(th_f)
@@ -418,8 +687,9 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
 
     dr_dl = Delta_f / Sigma_f * p_r_f
     dth_dl = p_th_f / Sigma_f
-    dphi_dl = (-2.0 * M * a * r_f / (Sigma_f * Delta_f) * p_t_f
-               + (Delta_f - a * a * sin_th_sq) / (Sigma_f * Delta_f * sin_th_sq) * p_phi_f)
+    dphi_dl = (-2.0 * M * a * r_f / (Sigma_f * Delta_f) * p_t
+               + (Delta_f - a * a * sin_th_sq)
+               / (Sigma_f * Delta_f * sin_th_sq) * p_phi)
 
     sin_phi = np.sin(phi_f)
     cos_phi = np.cos(phi_f)
@@ -432,7 +702,8 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
           + r_f * sin_th * cos_phi * dphi_dl)
     vz = cos_th * dr_dl - r_f * sin_th * dth_dl
 
-    if (not np.isfinite(vx) or not np.isfinite(vy) or not np.isfinite(vz)):
+    if (not np.isfinite(vx) or not np.isfinite(vy)
+            or not np.isfinite(vz)):
         return 0, np.nan, n_half_orbits
 
     v_mag = np.sqrt(vx * vx + vy * vy + vz * vz)
@@ -441,6 +712,27 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
 
     final_alpha = np.arccos(_clip_scalar(-vx / v_mag, -1.0, 1.0))
     return 1, final_alpha, n_half_orbits
+
+
+@njit(parallel=True, cache=True)
+def _trace_rays_batch_schwarzschild(M, R_S, r_obs, alphas, phi_max, h_max,
+                                     out_fa, out_w):
+    for i in prange(alphas.shape[0]):
+        s, fa, nh = _schwarzschild_trace_ray_numba(
+            M, R_S, r_obs, alphas[i], phi_max, h_max)
+        out_fa[i] = fa if s == 1 else np.nan
+        out_w[i] = nh
+
+
+@njit(parallel=True, cache=True)
+def _trace_rays_batch_kerr(M, a, r_plus, r_obs, alphas, thetas, theta_obs,
+                            lambda_max, axis_refines, out_fa, out_w):
+    for i in prange(alphas.shape[0]):
+        s, fa, nh = _kerr_trace_ray_numba(
+            M, a, r_plus, r_obs, alphas[i], thetas[i], theta_obs,
+            lambda_max, 1.0, axis_refines[i])
+        out_fa[i] = fa if s == 1 else np.nan
+        out_w[i] = nh
 
 
 class Metric(ABC):
@@ -578,24 +870,17 @@ class Schwarzschild(Metric):
 
         Returns (final_alpha, n_half_orbits, outcome).
         """
-        status, phi_f, u_f, w_f = _schwarzschild_trace_orbit_numba(
+        status, final_alpha, n_half_orbits = _schwarzschild_trace_ray_numba(
             self.M, self.R_S, r_obs, alpha, phi_max, 0.05)
         if status == 0:
             return np.nan, 0, 'invalid'
-
-        r_f = 1.0 / u_f
-        if status == -1 or r_f <= self.R_S * 1.1:
-            return np.nan, int(abs(phi_f) // np.pi), 'captured'
-
-        dr_dphi = -w_f / (u_f * u_f)
-        heading = np.arctan2(
-            dr_dphi * np.sin(phi_f) + r_f * np.cos(phi_f),
-            dr_dphi * np.cos(phi_f) - r_f * np.sin(phi_f),
-        )
-        final_alpha = np.arccos(np.clip(-np.cos(heading), -1.0, 1.0))
-        n_half_orbits = int(abs(phi_f) // np.pi)
-
+        if status == -1:
+            return np.nan, n_half_orbits, 'captured'
         return final_alpha, n_half_orbits, 'escaped'
+
+    def trace_rays_batch(self, r_obs, alphas, out_fa, out_w):
+        _trace_rays_batch_schwarzschild(
+            self.M, self.R_S, r_obs, alphas, 50.0, 0.05, out_fa, out_w)
 
 
 # ============================================================================
@@ -645,33 +930,49 @@ class Kerr(Metric):
         results = []
         for r_ph in self._unstable_photon_r():
             Delta = self._Delta(r_ph)
-            xi = (r_ph**2 + a**2) / a - r_ph * Delta / (a * (r_ph - M))
+            xi = ((r_ph**2 + a**2) / a
+                  - 2 * r_ph * Delta / (a * (r_ph - M)))
             eta = (r_ph**3 / (a**2 * (r_ph - M)**2)
                    * (4 * M * Delta - r_ph * (r_ph - M)**2))
             results.append((xi, eta))
         return results  # [(xi_pro, eta_pro), (xi_ret, eta_ret)]
 
     def alpha_crit(self, r_obs, theta_obs=np.pi / 2):
-        """Critical viewing angle. For Kerr this returns the larger
-        (retrograde) critical angle — the full shadow boundary is
-        asymmetric but this gives the conservative envelope."""
+        """Critical viewing angle. For Kerr this returns the maximum
+        impact parameter across all spherical photon orbits, giving the
+        conservative shadow envelope."""
         if self.a == 0:
-            # Reduce to Schwarzschild formula
             R_S = 2 * self.M
             B_CRIT = 3 * np.sqrt(3) * self.M
             f = 1 - R_S / r_obs
             arg = B_CRIT * np.sqrt(f) / r_obs
             return np.arcsin(np.clip(arg, -1.0, 1.0))
 
-        # Use retrograde (larger) critical impact parameter
-        crits = self._critical_impact_params()
-        xi_ret, eta_ret = crits[1]
-        b_crit = np.sqrt(xi_ret**2 + eta_ret)
+        M, a = self.M, self.a
+        r_pro, r_ret = self._unstable_photon_r()
+
+        # Sample b^2 = xi(r)^2 + max(eta(r), 0) across all spherical
+        # photon orbits to find the true maximum impact parameter.
+        r_arr = np.linspace(r_pro, r_ret, 50)
+        b2_max = 0.0
+        for r_ph in r_arr:
+            Delta = self._Delta(r_ph)
+            xi = ((r_ph**2 + a**2) / a
+                  - 2 * r_ph * Delta / (a * (r_ph - M)))
+            eta = (r_ph**3 / (a**2 * (r_ph - M)**2)
+                   * (4 * M * Delta - r_ph * (r_ph - M)**2))
+            b2 = xi**2 + max(eta, 0.0)
+            if b2 > b2_max:
+                b2_max = b2
+
+        # Schwarzschild floor as safety clamp
+        b_schwarz = 3 * np.sqrt(3) * M
+        b_crit = max(np.sqrt(b2_max), b_schwarz)
 
         Delta_obs = self._Delta(r_obs)
         Sigma_obs = self._Sigma(r_obs, theta_obs)
         sin_th = np.sin(theta_obs)
-        A = (r_obs**2 + self.a**2)**2 - self.a**2 * Delta_obs * sin_th**2
+        A = (r_obs**2 + a**2)**2 - a**2 * Delta_obs * sin_th**2
         arg = b_crit * np.sqrt(Sigma_obs * Delta_obs / A) / r_obs
         return np.arcsin(np.clip(arg, -1.0, 1.0))
 
@@ -864,9 +1165,15 @@ class Kerr(Metric):
         """
         status, final_alpha, n_half_orbits = _kerr_trace_ray_numba(
             self.M, self.a, self.r_plus, r_obs, alpha, theta, theta_obs,
-            5000.0, 1.0, axis_refine)
+            max(5000.0, 6.0 * r_obs), 1.0, axis_refine)
         if status == 0:
             return np.nan, 0, 'invalid'
         if status == -1:
             return np.nan, n_half_orbits, 'captured'
         return final_alpha, n_half_orbits, 'escaped'
+
+    def trace_rays_batch(self, r_obs, alphas, thetas, theta_obs,
+                         axis_refines, out_fa, out_w):
+        _trace_rays_batch_kerr(
+            self.M, self.a, self.r_plus, r_obs, alphas, thetas, theta_obs,
+            max(5000.0, 6.0 * r_obs), axis_refines, out_fa, out_w)
