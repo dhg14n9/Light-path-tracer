@@ -152,48 +152,7 @@ def build_alpha_lookup(image_dimension, fov, decimals=None, psi=(0.0, 0.0)):
     return alpha.astype(np.float32)
 
 
-# Global reference to metric for multiprocessing workers
-_worker_metric = None
-
-
-def _init_worker(metric_cls_name, metric_kwargs):
-    """Initialize the metric in each worker process."""
-    global _worker_metric
-    from metrics import Schwarzschild, Kerr
-    cls = {'Schwarzschild': Schwarzschild, 'Kerr': Kerr}[metric_cls_name]
-    _worker_metric = cls(**metric_kwargs)
-
-
-def _trace_single_alpha(args):
-    """Trace one alpha bin (1D, spherically symmetric)."""
-    idx, alpha, r_obs = args
-    final_alpha, n_half_orbits, outcome = _worker_metric.trace_ray(
-        r_obs, alpha)
-    if outcome != 'escaped':
-        return (idx, np.nan, 0)
-    return (idx, final_alpha, n_half_orbits)
-
-
-def _trace_single_alpha_theta(args):
-    """Trace one (alpha, theta) bin (2D, for non-spherically symmetric)."""
-    idx, alpha, screen_theta, r_obs, theta_obs, axis_refine = args
-    try:
-        final_alpha, n_half_orbits, outcome = _worker_metric.trace_ray(
-            r_obs, alpha, theta=screen_theta, theta_obs=theta_obs,
-            axis_refine=bool(axis_refine))
-    except TypeError:
-        # Fallback for metrics that do not expose axis_refine.
-        final_alpha, n_half_orbits, outcome = _worker_metric.trace_ray(
-            r_obs, alpha, theta=screen_theta, theta_obs=theta_obs)
-    if outcome != 'escaped':
-        return (idx, np.nan, 0)
-    return (idx, final_alpha, n_half_orbits)
-
-
-def precompute_final_alpha_lookup(
-    alpha_lookup, alpha_crit, r_obs, metric,
-    num_worker=None,
-):
+def precompute_final_alpha_lookup(alpha_lookup, alpha_crit, r_obs, metric):
     """Trace one ray per pixel (1D alpha-only, spherically symmetric)."""
     alpha_flat = alpha_lookup.ravel().astype(np.float64)
     n = alpha_flat.size
@@ -225,7 +184,7 @@ def precompute_final_alpha_lookup(
 
 def precompute_final_alpha_lookup_2d(
     alpha_lookup, fov, alpha_crit, r_obs, metric,
-    theta_obs=np.pi / 2, num_worker=None, psi=(0.0, 0.0),
+    theta_obs=np.pi / 2, psi=(0.0, 0.0),
 ):
     """Trace one ray per pixel for non-spherically-symmetric metrics."""
     shape = alpha_lookup.shape
@@ -374,8 +333,7 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
             lensed[winding] = WINDING_COLORS[idx]
 
     # Escaped and within FOV
-    escaped = valid & ~np.isnan(final_alpha_lookup) & (
-        final_alpha_lookup <= np.pi / 2)
+    escaped = valid & (final_alpha_lookup <= np.pi / 2)
     n_escaped = np.count_nonzero(escaped)
 
     if n_escaped > 0:
@@ -384,12 +342,14 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
 
         sin_fa = np.sin(fa)
         cos_fa = np.cos(fa)
+        sin_th = np.sin(th)
+        cos_th = np.cos(th)
         src_vx = (cos_fa * d[0]
-                  + sin_fa * (np.sin(th) * e_x[0] + np.cos(th) * e_y[0]))
+                  + sin_fa * (sin_th * e_x[0] + cos_th * e_y[0]))
         src_vy = (cos_fa * d[1]
-                  + sin_fa * (np.sin(th) * e_x[1] + np.cos(th) * e_y[1]))
+                  + sin_fa * (sin_th * e_x[1] + cos_th * e_y[1]))
         src_vz = (cos_fa * d[2]
-                  + sin_fa * (np.sin(th) * e_x[2] + np.cos(th) * e_y[2]))
+                  + sin_fa * (sin_th * e_x[2] + cos_th * e_y[2]))
 
         if render_loop_around:
             # Keep legacy "wrap" behavior only for the front-facing branch.
@@ -409,8 +369,8 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
             src_y_cam = np.empty_like(src_vy)
             src_x_cam[front] = src_vx[front] / src_vz[front]
             src_y_cam[front] = src_vy[front] / src_vz[front]
-            src_x = np.empty_like(src_vx, dtype=np.intp)
-            src_y = np.empty_like(src_vy, dtype=np.intp)
+            src_x = np.full_like(src_vx, -1, dtype=np.intp)
+            src_y = np.full_like(src_vy, -1, dtype=np.intp)
             src_x[front] = np.rint(src_x_cam[front] * fx + width / 2).astype(np.intp)
             src_y[front] = np.rint(src_y_cam[front] * fy + height / 2).astype(np.intp)
 
@@ -480,7 +440,6 @@ def main(metric=None, M=1.0, a=0.0, r_obs_mult=100.0,
     print(f"Metric: {type(metric).__name__} "
           f"(M={metric.M}, a={getattr(metric, 'a', 0)})")
 
-    debug_benchmark = True
     timings = {}
     total_start = perf_counter()
 
@@ -552,9 +511,8 @@ def main(metric=None, M=1.0, a=0.0, r_obs_mult=100.0,
     timings["save_image"] = perf_counter() - stage_start
     timings["total"] = perf_counter() - total_start
 
-    if debug_benchmark:
-        print_benchmark_summary(
-            (height, width), alpha_crit, total_rays, traced_rays, timings)
+    print_benchmark_summary(
+        (height, width), alpha_crit, total_rays, traced_rays, timings)
 
 
 if __name__ == "__main__":

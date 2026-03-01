@@ -324,14 +324,6 @@ def _rk4_step_kerr_numba(state, h, p_t, p_phi, M, a, r_plus,
 
 
 @njit(cache=True)
-def _all_finite8(x):
-    for i in range(8):
-        if not np.isfinite(x[i]):
-            return False
-    return True
-
-
-@njit(cache=True)
 def _all_finite5(x):
     for i in range(5):
         if not np.isfinite(x[i]):
@@ -366,6 +358,62 @@ _DP_E4 = 71.0 / 1920.0
 _DP_E5 = -17253.0 / 339200.0
 _DP_E6 = 22.0 / 525.0
 _DP_E7 = -1.0 / 40.0
+
+
+@njit(cache=True)
+def _kerr_extract_angle(state, p_t, p_phi, M, a, r_capture, event_status):
+    """Extract final deflection angle from integrated Kerr state."""
+    r_f = state[0]
+    th_f = state[1]
+    phi_f = state[2]
+    p_r_f = state[3]
+    p_th_f = state[4]
+
+    n_half_orbits = int(np.abs(phi_f) // np.pi)
+
+    if r_f <= r_capture * 1.1 or event_status == -1:
+        return -1, np.nan, n_half_orbits
+    if (not np.isfinite(r_f) or not np.isfinite(th_f)
+            or not np.isfinite(phi_f)):
+        return 0, np.nan, 0
+
+    sin_th = np.sin(th_f)
+    cos_th = np.cos(th_f)
+    sin_th_sq = sin_th * sin_th
+    if sin_th_sq < 1e-15:
+        sin_th_sq = 1e-15
+    Sigma_f = r_f * r_f + a * a * cos_th * cos_th
+    Delta_f = r_f * r_f - 2.0 * M * r_f + a * a
+    if Sigma_f <= 1e-15 or np.abs(Delta_f) <= 1e-15:
+        return 0, np.nan, n_half_orbits
+
+    dr_dl = Delta_f / Sigma_f * p_r_f
+    dth_dl = p_th_f / Sigma_f
+    dphi_dl = (-2.0 * M * a * r_f / (Sigma_f * Delta_f) * p_t
+               + (Delta_f - a * a * sin_th_sq)
+               / (Sigma_f * Delta_f * sin_th_sq) * p_phi)
+
+    sin_phi = np.sin(phi_f)
+    cos_phi = np.cos(phi_f)
+
+    vx = (sin_th * cos_phi * dr_dl
+          + r_f * cos_th * cos_phi * dth_dl
+          - r_f * sin_th * sin_phi * dphi_dl)
+    vy = (sin_th * sin_phi * dr_dl
+          + r_f * cos_th * sin_phi * dth_dl
+          + r_f * sin_th * cos_phi * dphi_dl)
+    vz = cos_th * dr_dl - r_f * sin_th * dth_dl
+
+    if (not np.isfinite(vx) or not np.isfinite(vy)
+            or not np.isfinite(vz)):
+        return 0, np.nan, n_half_orbits
+
+    v_mag = np.sqrt(vx * vx + vy * vy + vz * vz)
+    if v_mag < 1e-30:
+        return 1, np.nan, n_half_orbits
+
+    final_alpha = np.arccos(_clip_scalar(-vx / v_mag, -1.0, 1.0))
+    return 1, final_alpha, n_half_orbits
 
 
 @njit(cache=True)
@@ -449,8 +497,7 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
         # Stage 7 (FSAL: becomes k1 of next step on accept)
         _kerr_geodesic_equations_numba(next_state, p_t, p_phi, M, a, r_plus, k7)
 
-        # Validity check: state[0] is r
-        if not (_all_finite5(next_state) and next_state[0] > 0.0):
+        if not _all_finite5(next_state) or next_state[0] <= 0.0:
             h *= 0.25
             if h < h_min:
                 return 0, np.nan, 0
@@ -516,58 +563,8 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
         else:
             h *= min(5.0, 0.9 * err_norm ** (-0.2))
 
-    # -- Final angle extraction --
-    r_f = state[0]
-    th_f = state[1]
-    phi_f = state[2]
-    p_r_f = state[3]
-    p_th_f = state[4]
-
-    n_half_orbits = int(np.abs(phi_f) // np.pi)
-
-    if r_f <= r_capture * 1.1 or event_status == -1:
-        return -1, np.nan, n_half_orbits
-    if (not np.isfinite(r_f) or not np.isfinite(th_f)
-            or not np.isfinite(phi_f)):
-        return 0, np.nan, 0
-
-    sin_th = np.sin(th_f)
-    cos_th = np.cos(th_f)
-    sin_th_sq = sin_th * sin_th
-    if sin_th_sq < 1e-15:
-        sin_th_sq = 1e-15
-    Sigma_f = r_f * r_f + a * a * cos_th * cos_th
-    Delta_f = r_f * r_f - 2.0 * M * r_f + a * a
-    if Sigma_f <= 1e-15 or np.abs(Delta_f) <= 1e-15:
-        return 0, np.nan, n_half_orbits
-
-    dr_dl = Delta_f / Sigma_f * p_r_f
-    dth_dl = p_th_f / Sigma_f
-    dphi_dl = (-2.0 * M * a * r_f / (Sigma_f * Delta_f) * p_t
-               + (Delta_f - a * a * sin_th_sq)
-               / (Sigma_f * Delta_f * sin_th_sq) * p_phi)
-
-    sin_phi = np.sin(phi_f)
-    cos_phi = np.cos(phi_f)
-
-    vx = (sin_th * cos_phi * dr_dl
-          + r_f * cos_th * cos_phi * dth_dl
-          - r_f * sin_th * sin_phi * dphi_dl)
-    vy = (sin_th * sin_phi * dr_dl
-          + r_f * cos_th * sin_phi * dth_dl
-          + r_f * sin_th * cos_phi * dphi_dl)
-    vz = cos_th * dr_dl - r_f * sin_th * dth_dl
-
-    if (not np.isfinite(vx) or not np.isfinite(vy)
-            or not np.isfinite(vz)):
-        return 0, np.nan, n_half_orbits
-
-    v_mag = np.sqrt(vx * vx + vy * vy + vz * vz)
-    if v_mag < 1e-30:
-        return 1, np.nan, n_half_orbits
-
-    final_alpha = np.arccos(_clip_scalar(-vx / v_mag, -1.0, 1.0))
-    return 1, final_alpha, n_half_orbits
+    return _kerr_extract_angle(state, p_t, p_phi, M, a, r_capture,
+                               event_status)
 
 
 @njit(cache=True)
@@ -614,17 +611,13 @@ def _kerr_trace_ray_rk4_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
             h = min(h, 0.03 if axis_refine else 0.05)
 
         r_prev = state[0]
-        step_ok = False
 
         while True:
             _rk4_step_kerr_numba(
                 state, h, p_t, p_phi, M, a, r_plus,
                 k1, k2, k3, k4, tmp, next_state)
 
-            if (_all_finite5(next_state)
-                    and np.isfinite(next_state[0])
-                    and next_state[0] > 0.0):
-                step_ok = True
+            if _all_finite5(next_state) and next_state[0] > 0.0:
                 break
 
             if h <= h_floor:
@@ -661,57 +654,8 @@ def _kerr_trace_ray_rk4_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
         if not _all_finite5(state):
             return 0, np.nan, 0
 
-    r_f = state[0]
-    th_f = state[1]
-    phi_f = state[2]
-    p_r_f = state[3]
-    p_th_f = state[4]
-
-    n_half_orbits = int(np.abs(phi_f) // np.pi)
-
-    if r_f <= r_capture * 1.1 or event_status == -1:
-        return -1, np.nan, n_half_orbits
-    if (not np.isfinite(r_f) or not np.isfinite(th_f)
-            or not np.isfinite(phi_f)):
-        return 0, np.nan, 0
-
-    sin_th = np.sin(th_f)
-    cos_th = np.cos(th_f)
-    sin_th_sq = sin_th * sin_th
-    if sin_th_sq < 1e-15:
-        sin_th_sq = 1e-15
-    Sigma_f = r_f * r_f + a * a * cos_th * cos_th
-    Delta_f = r_f * r_f - 2.0 * M * r_f + a * a
-    if Sigma_f <= 1e-15 or np.abs(Delta_f) <= 1e-15:
-        return 0, np.nan, n_half_orbits
-
-    dr_dl = Delta_f / Sigma_f * p_r_f
-    dth_dl = p_th_f / Sigma_f
-    dphi_dl = (-2.0 * M * a * r_f / (Sigma_f * Delta_f) * p_t
-               + (Delta_f - a * a * sin_th_sq)
-               / (Sigma_f * Delta_f * sin_th_sq) * p_phi)
-
-    sin_phi = np.sin(phi_f)
-    cos_phi = np.cos(phi_f)
-
-    vx = (sin_th * cos_phi * dr_dl
-          + r_f * cos_th * cos_phi * dth_dl
-          - r_f * sin_th * sin_phi * dphi_dl)
-    vy = (sin_th * sin_phi * dr_dl
-          + r_f * cos_th * sin_phi * dth_dl
-          + r_f * sin_th * cos_phi * dphi_dl)
-    vz = cos_th * dr_dl - r_f * sin_th * dth_dl
-
-    if (not np.isfinite(vx) or not np.isfinite(vy)
-            or not np.isfinite(vz)):
-        return 0, np.nan, n_half_orbits
-
-    v_mag = np.sqrt(vx * vx + vy * vy + vz * vz)
-    if v_mag < 1e-30:
-        return 1, np.nan, n_half_orbits
-
-    final_alpha = np.arccos(_clip_scalar(-vx / v_mag, -1.0, 1.0))
-    return 1, final_alpha, n_half_orbits
+    return _kerr_extract_angle(state, p_t, p_phi, M, a, r_capture,
+                               event_status)
 
 
 @njit(parallel=True, cache=True)
@@ -824,17 +768,23 @@ class Schwarzschild(Metric):
 
         f = self._f(r)
         R_S = self.R_S
+        sin_th = np.sin(th)
+        cos_th = np.cos(th)
+        sin_th_sq = sin_th ** 2
+        if sin_th_sq < 1e-15:
+            sin_th_sq = 1e-15
 
-        dt = p_t / f
+        # g^{tt} = -1/f, convention p_t = -E
+        dt = -p_t / f
         dr = f * p_r
         dth = p_th / r**2
-        dphi = p_phi / r**2
+        dphi = p_phi / (r**2 * sin_th_sq)
 
         dp_t = 0.0
         dp_r = (-(R_S / (2 * r**2)) * (p_t**2 / f**2)
                 - (R_S / (2 * r**2)) * p_r**2
-                + (p_th**2 + p_phi**2) / r**3)
-        dp_th = 0.0  # equatorial, p_theta stays 0
+                + (p_th**2 + p_phi**2 / sin_th_sq) / r**3)
+        dp_th = cos_th * p_phi**2 / (r**2 * sin_th_sq * sin_th)
         dp_phi = 0.0
 
         return [dt, dr, dth, dphi, dp_t, dp_r, dp_th, dp_phi]
@@ -856,7 +806,7 @@ class Schwarzschild(Metric):
         p_r = -np.sqrt(p_r_sq)  # inward
 
         return [0.0, r_obs, np.pi / 2, 0.0,
-                E, p_r, 0.0, L]
+                -E, p_r, 0.0, L]
 
     # -- Orbit equation (fast path) ------------------------------------------
 
@@ -927,6 +877,9 @@ class Kerr(Metric):
         """Critical impact parameters (b, q) for prograde and retrograde
         photon orbits."""
         M, a = self.M, self.a
+        if a == 0:
+            raise ValueError(
+                "_critical_impact_params undefined for a=0")
         results = []
         for r_ph in self._unstable_photon_r():
             Delta = self._Delta(r_ph)
