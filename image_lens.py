@@ -152,7 +152,9 @@ def build_alpha_lookup(image_dimension, fov, decimals=None, psi=(0.0, 0.0)):
     return alpha.astype(np.float32)
 
 
-def precompute_final_alpha_lookup(alpha_lookup, alpha_crit, r_obs, metric):
+def precompute_final_alpha_lookup(alpha_lookup, alpha_crit, r_obs, metric,
+                                  show_progress=False,
+                                  progress_callback=None):
     """Trace one ray per pixel (1D alpha-only, spherically symmetric)."""
     alpha_flat = alpha_lookup.ravel().astype(np.float64)
     n = alpha_flat.size
@@ -161,17 +163,21 @@ def precompute_final_alpha_lookup(alpha_lookup, alpha_crit, r_obs, metric):
     winding_flat = np.zeros(n, dtype=np.int64)
 
     if n == 0:
+        if progress_callback is not None:
+            progress_callback(0, 0)
         return (np.full(alpha_lookup.shape, np.nan, dtype=np.float32),
                 np.zeros(alpha_lookup.shape, dtype=WINDING_DTYPE),
                 n, 0)
 
     chunk = 50_000
     for start in tqdm(range(0, n, chunk), desc="Tracing per-pixel rays",
-                      unit="chunk"):
+                      unit="chunk", disable=not show_progress):
         end = min(start + chunk, n)
         metric.trace_rays_batch(
             r_obs, alpha_flat[start:end],
             final_alpha_flat[start:end], winding_flat[start:end])
+        if progress_callback is not None:
+            progress_callback(end, n)
 
     fa_out = final_alpha_flat.astype(np.float32).reshape(alpha_lookup.shape)
     w_out = np.clip(winding_flat, 0, WINDING_MAX).astype(WINDING_DTYPE).reshape(alpha_lookup.shape)
@@ -185,6 +191,8 @@ def precompute_final_alpha_lookup(alpha_lookup, alpha_crit, r_obs, metric):
 def precompute_final_alpha_lookup_2d(
     alpha_lookup, fov, alpha_crit, r_obs, metric,
     theta_obs=np.pi / 2, psi=(0.0, 0.0),
+    show_progress=False, debug=False,
+    progress_callback=None,
 ):
     """Trace one ray per pixel for non-spherically-symmetric metrics."""
     shape = alpha_lookup.shape
@@ -233,12 +241,13 @@ def precompute_final_alpha_lookup_2d(
                                      dtype=np.float32)
     winding_trace_flat = np.zeros(alpha_trace_flat.shape, dtype=WINDING_DTYPE)
 
-    if use_tb_symmetry:
-        print(f"  tracing {valid_indices.size:,} rays with top/bottom symmetry "
-              f"({alpha_lookup.size:,} pixels total)")
-    else:
-        print(f"  tracing {valid_indices.size:,} rays "
-              f"({alpha_lookup.size:,} pixels total)")
+    if debug:
+        if use_tb_symmetry:
+            print(f"  tracing {valid_indices.size:,} rays with top/bottom symmetry "
+                  f"({alpha_lookup.size:,} pixels total)")
+        else:
+            print(f"  tracing {valid_indices.size:,} rays "
+                  f"({alpha_lookup.size:,} pixels total)")
 
     if valid_indices.size:
         alpha_f64 = alpha_trace_flat.astype(np.float64)
@@ -250,15 +259,20 @@ def precompute_final_alpha_lookup_2d(
 
         chunk = 50_000
         for start in tqdm(range(0, alpha_f64.size, chunk),
-                          desc="Tracing per-pixel rays", unit="chunk"):
+                          desc="Tracing per-pixel rays", unit="chunk",
+                          disable=not show_progress):
             end = min(start + chunk, alpha_f64.size)
             metric.trace_rays_batch(
                 r_obs, alpha_f64[start:end], theta_f64[start:end],
                 theta_obs, axis_f64[start:end],
                 fa_buf[start:end], w_buf[start:end])
+            if progress_callback is not None:
+                progress_callback(end, alpha_f64.size)
 
         final_alpha_trace_flat[:] = fa_buf.astype(np.float32)
         winding_trace_flat[:] = np.clip(w_buf, 0, WINDING_MAX).astype(WINDING_DTYPE)
+    elif progress_callback is not None:
+        progress_callback(0, 0)
 
     final_alpha_out = np.full(shape, np.nan, dtype=np.float32)
     winding_out = np.zeros(shape, dtype=WINDING_DTYPE)
@@ -398,8 +412,24 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
 
 
 # ============================================================================
-# Benchmark
+# Debug / Benchmark
 # ============================================================================
+
+def _debug_log(enabled, message):
+    if enabled:
+        print(message)
+
+
+def _bench_start(enabled):
+    if enabled:
+        return perf_counter()
+    return None
+
+
+def _bench_stop(enabled, timings, key, start_time):
+    if enabled and start_time is not None:
+        timings[key] = perf_counter() - start_time
+
 
 def print_benchmark_summary(image_dimension, alpha_crit, total_rays,
                             traced_rays, timings):
@@ -430,33 +460,37 @@ def print_benchmark_summary(image_dimension, alpha_crit, total_rays,
 # ============================================================================
 
 def main(metric=None, M=1.0, a=0.0, r_obs_mult=100.0,
-         psi=(0.0, 0.0), vertical_fov_deg=40.0):
+         psi=(0.0, 0.0), vertical_fov_deg=40.0,
+         debug=False, benchmark=False):
     if metric is None:
         if a == 0:
             metric = Schwarzschild(M=M)
         else:
             metric = Kerr(M=M, a=a)
 
-    print(f"Metric: {type(metric).__name__} "
-          f"(M={metric.M}, a={getattr(metric, 'a', 0)})")
+    _debug_log(debug, f"Metric: {type(metric).__name__} "
+                      f"(M={metric.M}, a={getattr(metric, 'a', 0)})")
 
     timings = {}
-    total_start = perf_counter()
+    total_start = _bench_start(benchmark)
 
     # Load image
-    stage_start = perf_counter()
+    stage_start = _bench_start(benchmark)
     img = mpimg.imread('image.jpg')
     if img.dtype == np.uint8:
         img = img.astype(np.float32) / 255.0
-    timings["load_image"] = perf_counter() - stage_start
+    _bench_stop(benchmark, timings, "load_image", stage_start)
 
     height, width = img.shape[:2]
-    print(f"Image: {width}x{height}")
+    _debug_log(debug, f"Image: {width}x{height}")
 
     # Observer properties
     r_obs = r_obs_mult * metric.M
     alpha_crit = metric.alpha_crit(r_obs)
-    print(f"r_obs = {r_obs:.1f} M, alpha_crit = {np.degrees(alpha_crit):.4f} deg")
+    _debug_log(
+        debug,
+        f"r_obs = {r_obs:.1f} M, alpha_crit = {np.degrees(alpha_crit):.4f} deg",
+    )
 
     vertical_fov = np.radians(vertical_fov_deg)
     horizontal_fov = 2 * np.arctan(np.tan(vertical_fov / 2) * width / height)
@@ -468,51 +502,57 @@ def main(metric=None, M=1.0, a=0.0, r_obs_mult=100.0,
                  and abs(bh_x_cam) <= np.tan(horizontal_fov / 2))
     bh_pos_status = ("behind observer" if not bh_in_front
                      else ("inside FOV" if bh_in_fov else "outside FOV"))
-    print("BH screen offset: "
-          f"psi_y={np.degrees(psi_y):.4f} deg, "
-          f"psi_x={np.degrees(psi_x):.4f} deg "
-          f"({bh_pos_status})")
+    _debug_log(
+        debug,
+        "BH screen offset: "
+        f"psi_y={np.degrees(psi_y):.4f} deg, "
+        f"psi_x={np.degrees(psi_x):.4f} deg "
+        f"({bh_pos_status})",
+    )
 
     render_loop_around = False
     if metric.is_spherically_symmetric:
-        print("Building per-pixel alpha lookup...")
-        stage_start = perf_counter()
+        _debug_log(debug, "Building per-pixel alpha lookup...")
+        stage_start = _bench_start(benchmark)
         alpha_lookup = build_alpha_lookup((height, width), fov, psi=psi)
-        timings["build_lookup"] = perf_counter() - stage_start
+        _bench_stop(benchmark, timings, "build_lookup", stage_start)
 
-        stage_start = perf_counter()
+        stage_start = _bench_start(benchmark)
         (final_alpha_lookup, winding_lookup,
          total_rays, traced_rays) = precompute_final_alpha_lookup(
-            alpha_lookup, alpha_crit, r_obs, metric)
-        timings["precompute"] = perf_counter() - stage_start
+            alpha_lookup, alpha_crit, r_obs, metric,
+            show_progress=debug)
+        _bench_stop(benchmark, timings, "precompute", stage_start)
     else:
-        print("Building per-pixel (alpha, theta) lookup...")
-        stage_start = perf_counter()
+        _debug_log(debug, "Building per-pixel (alpha, theta) lookup...")
+        stage_start = _bench_start(benchmark)
         alpha_lookup = build_alpha_lookup((height, width), fov, psi=psi)
-        timings["build_lookup"] = perf_counter() - stage_start
+        _bench_stop(benchmark, timings, "build_lookup", stage_start)
 
-        stage_start = perf_counter()
+        stage_start = _bench_start(benchmark)
         (final_alpha_lookup, winding_lookup,
          total_rays, traced_rays) = precompute_final_alpha_lookup_2d(
-            alpha_lookup, fov, alpha_crit, r_obs, metric, psi=psi)
-        timings["precompute"] = perf_counter() - stage_start
+            alpha_lookup, fov, alpha_crit, r_obs, metric,
+            psi=psi, show_progress=debug, debug=debug)
+        _bench_stop(benchmark, timings, "precompute", stage_start)
 
     # Render
-    stage_start = perf_counter()
+    stage_start = _bench_start(benchmark)
     lensed_image = render_lensed_image(
         img, alpha_lookup, final_alpha_lookup, winding_lookup,
         alpha_crit, fov, render_loop_around, psi=psi,
     )
-    timings["render"] = perf_counter() - stage_start
+    _bench_stop(benchmark, timings, "render", stage_start)
 
     # Save
-    stage_start = perf_counter()
+    stage_start = _bench_start(benchmark)
     mpimg.imsave('lensed_image.png', lensed_image)
-    timings["save_image"] = perf_counter() - stage_start
-    timings["total"] = perf_counter() - total_start
+    _bench_stop(benchmark, timings, "save_image", stage_start)
 
-    print_benchmark_summary(
-        (height, width), alpha_crit, total_rays, traced_rays, timings)
+    if benchmark and total_start is not None:
+        timings["total"] = perf_counter() - total_start
+        print_benchmark_summary(
+            (height, width), alpha_crit, total_rays, traced_rays, timings)
 
 
 if __name__ == "__main__":
@@ -529,7 +569,12 @@ if __name__ == "__main__":
                         help="BH horizontal offset in deg (+ = right, - = left)")
     parser.add_argument("--fov-v", type=float, default=40.0,
                         help="Vertical field of view in deg")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable debug logs and progress bars")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Enable benchmark timing summary")
     args = parser.parse_args()
     main(M=args.M, a=args.a, r_obs_mult=args.r_obs,
          psi=(np.radians(args.psi_y), np.radians(args.psi_x)),
-         vertical_fov_deg=args.fov_v)
+         vertical_fov_deg=args.fov_v,
+         debug=args.debug, benchmark=args.benchmark)
