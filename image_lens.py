@@ -332,8 +332,11 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
 
     valid = np.isfinite(final_alpha_lookup)
 
-    # Winding: escaped rays that turned past pi/2
-    winding = valid & (final_alpha_lookup > np.pi / 2)
+    # Winding: escaped rays that actually orbited the BH (n_half_orbits > 0)
+    if winding_lookup is not None:
+        winding = valid & (winding_lookup > 0)
+    else:
+        winding = valid & (final_alpha_lookup > np.pi / 2)
     if np.any(winding):
         if winding_lookup is not None:
             idx = np.clip(winding_lookup[winding], 0, len(WINDING_COLORS) - 1)
@@ -346,8 +349,8 @@ def render_lensed_image(source_image, alpha_lookup, final_alpha_lookup,
         else:
             lensed[winding] = WINDING_COLORS[idx]
 
-    # Escaped and within FOV
-    escaped = valid & (final_alpha_lookup <= np.pi / 2)
+    # Escaped rays (not winding)
+    escaped = valid & ~winding
     n_escaped = np.count_nonzero(escaped)
 
     if n_escaped > 0:

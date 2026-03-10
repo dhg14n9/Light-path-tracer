@@ -60,7 +60,7 @@ def _schwarzschild_trace_orbit_numba(M, R_S, r_obs, alpha, phi_max, h_max):
     w0_sq = 1.0 / (b * b) - u * u + 2.0 * M * u * u * u
     if w0_sq < 0.0:
         return 0, np.nan, 0.0, 0.0
-    w = np.sqrt(w0_sq)
+    w = np.sqrt(w0_sq) if np.cos(alpha) >= 0.0 else -np.sqrt(w0_sq)
 
     phi = 0.0
     u_capture = 1.0 / (R_S * 1.01)
@@ -207,7 +207,7 @@ def _kerr_initial_conditions_numba(M, a, r_obs, alpha, theta, theta_obs):
     p_r_sq = -other / g_rr_inv
     if p_r_sq < 0.0:
         p_r_sq = 0.0
-    p_r = -np.sqrt(p_r_sq)
+    p_r = -np.sqrt(p_r_sq) if np.cos(alpha) >= 0.0 else np.sqrt(p_r_sq)
 
     # 5D state: [r, θ, φ, p_r, p_θ]
     state[0] = r
@@ -803,7 +803,7 @@ class Schwarzschild(Metric):
         if p_r_sq < 0:
             return None
 
-        p_r = -np.sqrt(p_r_sq)  # inward
+        p_r = -np.sqrt(p_r_sq) if np.cos(alpha) >= 0 else np.sqrt(p_r_sq)
 
         return [0.0, r_obs, np.pi / 2, 0.0,
                 -E, p_r, 0.0, L]
@@ -1103,7 +1103,7 @@ class Kerr(Metric):
         p_r_sq = -other / g_rr_inv
         if p_r_sq < 0:
             p_r_sq = 0.0
-        p_r = -np.sqrt(p_r_sq)  # inward
+        p_r = -np.sqrt(p_r_sq) if np.cos(alpha) >= 0 else np.sqrt(p_r_sq)
 
         return [0.0, r, th, 0.0,
                 p_t, p_r, p_theta, p_phi]
