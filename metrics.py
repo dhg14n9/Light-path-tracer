@@ -146,6 +146,43 @@ def _schwarzschild_trace_ray_numba(M, R_S, r_obs, alpha, phi_max, h_max):
 
 
 @njit(cache=True)
+def _schwarzschild_trace_ray_with_dir_numba(M, R_S, r_obs, alpha, theta,
+                                            phi_max, h_max):
+    """Trace a Schwarzschild ray and return its exit direction in the
+    canonical camera frame (+x right, +y down, +z forward toward the BH)."""
+    status, phi_f, u_f, w_f = _schwarzschild_trace_orbit_numba(
+        M, R_S, r_obs, alpha, phi_max, h_max)
+    if status == 0:
+        return 0, np.nan, 0, np.nan, np.nan, np.nan
+
+    r_f = 1.0 / u_f
+    n_half_orbits = int(np.abs(phi_f) // np.pi)
+    if status == -1 or r_f <= R_S * 1.1:
+        return -1, np.nan, n_half_orbits, np.nan, np.nan, np.nan
+
+    dr_dphi = -w_f / (u_f * u_f)
+    sin_phi = np.sin(phi_f)
+    cos_phi = np.cos(phi_f)
+    dir_plane_x = dr_dphi * cos_phi - r_f * sin_phi
+    dir_plane_y = dr_dphi * sin_phi + r_f * cos_phi
+
+    v_mag = np.sqrt(dir_plane_x * dir_plane_x + dir_plane_y * dir_plane_y)
+    if v_mag < 1e-30:
+        return 1, np.nan, n_half_orbits, np.nan, np.nan, np.nan
+
+    dir_plane_x /= v_mag
+    dir_plane_y /= v_mag
+
+    sin_screen = np.sin(theta)
+    cos_screen = np.cos(theta)
+    vx_u = dir_plane_y * sin_screen
+    vy_u = dir_plane_y * cos_screen
+    vz_u = -dir_plane_x
+    final_alpha = np.arccos(_clip_scalar(vz_u, -1.0, 1.0))
+    return 1, final_alpha, n_half_orbits, vx_u, vy_u, vz_u
+
+
+@njit(cache=True)
 def _kerr_initial_conditions_numba(M, a, r_obs, alpha, theta, theta_obs):
     state = np.empty(5, dtype=np.float64)
 
@@ -361,8 +398,8 @@ _DP_E7 = -1.0 / 40.0
 
 
 @njit(cache=True)
-def _kerr_extract_angle(state, p_t, p_phi, M, a, r_capture, event_status):
-    """Extract final deflection angle from integrated Kerr state."""
+def _kerr_extract_direction(state, p_t, p_phi, M, a, r_capture, event_status):
+    """Extract final deflection angle and asymptotic direction."""
     r_f = state[0]
     th_f = state[1]
     phi_f = state[2]
@@ -372,10 +409,10 @@ def _kerr_extract_angle(state, p_t, p_phi, M, a, r_capture, event_status):
     n_half_orbits = int(np.abs(phi_f) // np.pi)
 
     if r_f <= r_capture * 1.1 or event_status == -1:
-        return -1, np.nan, n_half_orbits
+        return -1, np.nan, n_half_orbits, np.nan, np.nan, np.nan
     if (not np.isfinite(r_f) or not np.isfinite(th_f)
             or not np.isfinite(phi_f)):
-        return 0, np.nan, 0
+        return 0, np.nan, 0, np.nan, np.nan, np.nan
 
     sin_th = np.sin(th_f)
     cos_th = np.cos(th_f)
@@ -385,7 +422,7 @@ def _kerr_extract_angle(state, p_t, p_phi, M, a, r_capture, event_status):
     Sigma_f = r_f * r_f + a * a * cos_th * cos_th
     Delta_f = r_f * r_f - 2.0 * M * r_f + a * a
     if Sigma_f <= 1e-15 or np.abs(Delta_f) <= 1e-15:
-        return 0, np.nan, n_half_orbits
+        return 0, np.nan, n_half_orbits, np.nan, np.nan, np.nan
 
     dr_dl = Delta_f / Sigma_f * p_r_f
     dth_dl = p_th_f / Sigma_f
@@ -406,14 +443,17 @@ def _kerr_extract_angle(state, p_t, p_phi, M, a, r_capture, event_status):
 
     if (not np.isfinite(vx) or not np.isfinite(vy)
             or not np.isfinite(vz)):
-        return 0, np.nan, n_half_orbits
+        return 0, np.nan, n_half_orbits, np.nan, np.nan, np.nan
 
     v_mag = np.sqrt(vx * vx + vy * vy + vz * vz)
     if v_mag < 1e-30:
-        return 1, np.nan, n_half_orbits
+        return 1, np.nan, n_half_orbits, np.nan, np.nan, np.nan
 
-    final_alpha = np.arccos(_clip_scalar(-vx / v_mag, -1.0, 1.0))
-    return 1, final_alpha, n_half_orbits
+    vx_u = vx / v_mag
+    vy_u = vy / v_mag
+    vz_u = vz / v_mag
+    final_alpha = np.arccos(_clip_scalar(-vx_u, -1.0, 1.0))
+    return 1, final_alpha, n_half_orbits, vx_u, vy_u, vz_u
 
 
 @njit(cache=True)
@@ -423,7 +463,7 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
     ok, state, p_t, p_phi = _kerr_initial_conditions_numba(
         M, a, r_obs, alpha, theta, theta_obs)
     if not ok:
-        return 0, np.nan, 0
+        return 0, np.nan, 0, np.nan, np.nan, np.nan
 
     r_capture = r_plus * 1.01
     r_escape = r_obs * 2.0
@@ -500,7 +540,7 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
         if not _all_finite5(next_state) or next_state[0] <= 0.0:
             h *= 0.25
             if h < h_min:
-                return 0, np.nan, 0
+                return 0, np.nan, 0, np.nan, np.nan, np.nan
             continue
 
         # Error norm over all 5 dynamical components
@@ -518,7 +558,7 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
             factor = max(0.2, 0.9 * err_norm ** (-0.2))
             h *= factor
             if h < h_min:
-                return 0, np.nan, 0
+                return 0, np.nan, 0, np.nan, np.nan, np.nan
             continue
 
         # -- Accept step --
@@ -555,7 +595,7 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
         lam += h
 
         if not _all_finite5(state):
-            return 0, np.nan, 0
+            return 0, np.nan, 0, np.nan, np.nan, np.nan
 
         # Grow h for next step
         if err_norm < 1e-10:
@@ -563,8 +603,8 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
         else:
             h *= min(5.0, 0.9 * err_norm ** (-0.2))
 
-    return _kerr_extract_angle(state, p_t, p_phi, M, a, r_capture,
-                               event_status)
+    return _kerr_extract_direction(state, p_t, p_phi, M, a, r_capture,
+                                   event_status)
 
 
 @njit(cache=True)
@@ -574,7 +614,7 @@ def _kerr_trace_ray_rk4_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
     ok, state, p_t, p_phi = _kerr_initial_conditions_numba(
         M, a, r_obs, alpha, theta, theta_obs)
     if not ok:
-        return 0, np.nan, 0
+        return 0, np.nan, 0, np.nan, np.nan, np.nan
 
     r_capture = r_plus * 1.01
     r_escape = r_obs * 2.0
@@ -621,7 +661,7 @@ def _kerr_trace_ray_rk4_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
                 break
 
             if h <= h_floor:
-                return 0, np.nan, 0
+                return 0, np.nan, 0, np.nan, np.nan, np.nan
 
             h *= 0.5
 
@@ -652,10 +692,10 @@ def _kerr_trace_ray_rk4_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
         lam += h
 
         if not _all_finite5(state):
-            return 0, np.nan, 0
+            return 0, np.nan, 0, np.nan, np.nan, np.nan
 
-    return _kerr_extract_angle(state, p_t, p_phi, M, a, r_capture,
-                               event_status)
+    return _kerr_extract_direction(state, p_t, p_phi, M, a, r_capture,
+                                   event_status)
 
 
 @njit(parallel=True, cache=True)
@@ -669,14 +709,44 @@ def _trace_rays_batch_schwarzschild(M, R_S, r_obs, alphas, phi_max, h_max,
 
 
 @njit(parallel=True, cache=True)
+def _trace_rays_batch_schwarzschild_with_dir(M, R_S, r_obs, alphas, thetas,
+                                             phi_max, h_max,
+                                             out_fa, out_w,
+                                             out_vx, out_vy, out_vz):
+    for i in prange(alphas.shape[0]):
+        s, fa, nh, vx, vy, vz = _schwarzschild_trace_ray_with_dir_numba(
+            M, R_S, r_obs, alphas[i], thetas[i], phi_max, h_max)
+        out_fa[i] = fa if s == 1 else np.nan
+        out_w[i] = nh
+        out_vx[i] = vx if s == 1 else np.nan
+        out_vy[i] = vy if s == 1 else np.nan
+        out_vz[i] = vz if s == 1 else np.nan
+
+
+@njit(parallel=True, cache=True)
 def _trace_rays_batch_kerr(M, a, r_plus, r_obs, alphas, thetas, theta_obs,
                             lambda_max, axis_refines, out_fa, out_w):
     for i in prange(alphas.shape[0]):
-        s, fa, nh = _kerr_trace_ray_numba(
+        s, fa, nh, _, _, _ = _kerr_trace_ray_numba(
             M, a, r_plus, r_obs, alphas[i], thetas[i], theta_obs,
             lambda_max, 1.0, axis_refines[i])
         out_fa[i] = fa if s == 1 else np.nan
         out_w[i] = nh
+
+
+@njit(parallel=True, cache=True)
+def _trace_rays_batch_kerr_with_dir(M, a, r_plus, r_obs, alphas, thetas,
+                                    theta_obs, lambda_max, axis_refines,
+                                    out_fa, out_w, out_vx, out_vy, out_vz):
+    for i in prange(alphas.shape[0]):
+        s, fa, nh, vx, vy, vz = _kerr_trace_ray_numba(
+            M, a, r_plus, r_obs, alphas[i], thetas[i], theta_obs,
+            lambda_max, 1.0, axis_refines[i])
+        out_fa[i] = fa if s == 1 else np.nan
+        out_w[i] = nh
+        out_vx[i] = vx if s == 1 else np.nan
+        out_vy[i] = vy if s == 1 else np.nan
+        out_vz[i] = vz if s == 1 else np.nan
 
 
 class Metric(ABC):
@@ -831,6 +901,12 @@ class Schwarzschild(Metric):
     def trace_rays_batch(self, r_obs, alphas, out_fa, out_w):
         _trace_rays_batch_schwarzschild(
             self.M, self.R_S, r_obs, alphas, 50.0, 0.05, out_fa, out_w)
+
+    def trace_rays_batch_with_dir(self, r_obs, alphas, thetas,
+                                  out_fa, out_w, out_vx, out_vy, out_vz):
+        _trace_rays_batch_schwarzschild_with_dir(
+            self.M, self.R_S, r_obs, alphas, thetas, 50.0, 0.05,
+            out_fa, out_w, out_vx, out_vy, out_vz)
 
 
 # ============================================================================
@@ -1116,7 +1192,7 @@ class Kerr(Metric):
 
         Returns (final_alpha, n_half_orbits, outcome).
         """
-        status, final_alpha, n_half_orbits = _kerr_trace_ray_numba(
+        status, final_alpha, n_half_orbits, _, _, _ = _kerr_trace_ray_numba(
             self.M, self.a, self.r_plus, r_obs, alpha, theta, theta_obs,
             max(5000.0, 6.0 * r_obs), 1.0, axis_refine)
         if status == 0:
@@ -1130,3 +1206,11 @@ class Kerr(Metric):
         _trace_rays_batch_kerr(
             self.M, self.a, self.r_plus, r_obs, alphas, thetas, theta_obs,
             max(5000.0, 6.0 * r_obs), axis_refines, out_fa, out_w)
+
+    def trace_rays_batch_with_dir(self, r_obs, alphas, thetas, theta_obs,
+                                  axis_refines, out_fa, out_w,
+                                  out_vx, out_vy, out_vz):
+        _trace_rays_batch_kerr_with_dir(
+            self.M, self.a, self.r_plus, r_obs, alphas, thetas, theta_obs,
+            max(5000.0, 6.0 * r_obs), axis_refines,
+            out_fa, out_w, out_vx, out_vy, out_vz)

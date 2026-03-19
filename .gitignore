@@ -23,4 +23,4 @@ Thumbs.db
 # lookup table cache
 lookup_cache.npz
 
-cli_image_lens.py
+# cli_image_lens.py

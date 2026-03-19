@@ -15,7 +15,7 @@ def main(metric=None):
 
     r_obs = 50.0 * metric.M
 
-    alpha_deg = 8.0
+    alpha_deg = 172.0
     alpha = np.radians(alpha_deg)
 
     solution, outcome = trace_ray(metric, r_obs, alpha)
