@@ -478,6 +478,17 @@ def print_benchmark_summary(image_dimension, alpha_crit, total_rays,
           f"{(pixel_count / total_time) / 1e6:>10.2f} MPix/s")
 
 
+def _spin_mass_units_to_kerr_a(M, spin_over_mass):
+    return float(M) * float(spin_over_mass)
+
+
+def _metric_spin_over_mass(metric):
+    metric_mass = float(getattr(metric, "M", 0.0))
+    if np.isclose(metric_mass, 0.0):
+        return 0.0
+    return float(getattr(metric, "a", 0.0)) / metric_mass
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -487,13 +498,19 @@ def main(metric=None, M=1.0, a=0.0, r_obs_mult=100.0,
          debug=False, benchmark=False,
          wrap_outside_background_plane=False):
     if metric is None:
-        if a == 0:
+        if abs(a) > 1.0:
+            raise ValueError("Dimensionless BH spin a/M must be between -1 and 1")
+        if np.isclose(a, 0.0):
             metric = Schwarzschild(M=M)
         else:
-            metric = Kerr(M=M, a=a)
+            metric = Kerr(M=M, a=_spin_mass_units_to_kerr_a(M, a))
 
-    _debug_log(debug, f"Metric: {type(metric).__name__} "
-                      f"(M={metric.M}, a={getattr(metric, 'a', 0)})")
+    _debug_log(
+        debug,
+        f"Metric: {type(metric).__name__} "
+        f"(M={metric.M}, a/M={_metric_spin_over_mass(metric):g}, "
+        f"a={getattr(metric, 'a', 0):g})",
+    )
 
     timings = {}
     total_start = _bench_start(benchmark)
@@ -592,7 +609,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--M", type=float, default=1.0, help="BH mass")
     parser.add_argument("--a", type=float, default=0.0,
-                        help="BH spin (|a| <= M, 0 = Schwarzschild)")
+                        help="Dimensionless BH spin a/M (-1 <= a/M <= 1, 0 = Schwarzschild)")
     parser.add_argument("--r-obs", type=float, default=100.0,
                         help="Observer distance in units of M (default: 100)")
     parser.add_argument("--psi-y", type=float, default=0.0,

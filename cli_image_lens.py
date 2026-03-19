@@ -12,6 +12,7 @@ import curses
 import os
 import resource
 import sys
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -60,33 +61,126 @@ class AppConfig:
 
 
 FIELD_SPECS: list[dict[str, str]] = [
-    {"key": "source_mode", "label": "Background mode", "kind": "choice"},
-    {"key": "input_image", "label": "Background image", "kind": "text"},
-    {"key": "output_image", "label": "Output image", "kind": "text"},
-    {"key": "width", "label": "Output width (stripes)", "kind": "int"},
-    {"key": "height", "label": "Output height (stripes)", "kind": "int"},
-    {"key": "n_x", "label": "Vertical stripe count", "kind": "int"},
-    {"key": "n_y", "label": "Horizontal stripe count", "kind": "int"},
-    {"key": "color_visualization", "label": "Color visualization", "kind": "bool"},
-    {"key": "M", "label": "BH mass (M)", "kind": "float"},
-    {"key": "a", "label": "BH spin (a)", "kind": "float"},
-    {"key": "r_obs", "label": "Observer distance (in M)", "kind": "float"},
-    {"key": "psi_y", "label": "BH vertical offset (deg)", "kind": "float"},
-    {"key": "psi_x", "label": "BH horizontal offset (deg)", "kind": "float"},
-    {"key": "fov_v", "label": "Vertical FOV (deg)", "kind": "float"},
-    {"key": "debug", "label": "Debug logs + progress", "kind": "bool"},
-    {"key": "benchmark", "label": "Benchmark summary", "kind": "bool"},
+    {
+        "key": "source_mode",
+        "label": "Mode",
+        "kind": "choice",
+        "description": "Choose which background the black hole lenses. Image mode samples pixels from an input file, while stripes mode uses the procedural spherical stripe pattern.",
+    },
+    {
+        "key": "input_image",
+        "label": "Background Image",
+        "kind": "text",
+        "description": "Path to the source image used in image mode. The file must exist when you run in image mode, and this setting is ignored entirely in stripes mode.",
+    },
+    {
+        "key": "output_image",
+        "label": "Output Image",
+        "kind": "text",
+        "description": "Path where the rendered result will be written. Use a filename extension Matplotlib can save, such as .png.",
+    },
+    {
+        "key": "width",
+        "label": "Width",
+        "kind": "int",
+        "description": "Output width in pixels for stripes mode. Larger values produce more detail but increase tracing time and memory use.",
+    },
+    {
+        "key": "height",
+        "label": "Height",
+        "kind": "int",
+        "description": "Output height in pixels for stripes mode. Larger values produce more detail but increase tracing time and memory use.",
+    },
+    {
+        "key": "n_x",
+        "label": "Vertical Stripes",
+        "kind": "int",
+        "description": "Number of vertical stripe sectors wrapped around the background sphere. Higher values create finer longitudinal striping.",
+    },
+    {
+        "key": "n_y",
+        "label": "Horizontal Stripes",
+        "kind": "int",
+        "description": "Number of horizontal stripe sectors wrapped around the background sphere. Higher values create finer latitudinal striping.",
+    },
+    {
+        "key": "color_visualization",
+        "label": "Color Visualization",
+        "kind": "bool",
+        "description": "Stripes mode only. Replace the normal black-and-white stripe shading with the debugging visualization: stripe hits stay black and other escaped rays are colored by their traced final-theta quadrant.",
+    },
+    {
+        "key": "M",
+        "label": "BH Mass",
+        "kind": "float",
+        "description": "Black-hole mass in geometric units. This sets the internal scale of the metric and therefore rescales distances and the physical Kerr spin parameter.",
+    },
+    {
+        "key": "a",
+        "label": "BH Spin",
+        "kind": "float",
+        "description": "Dimensionless black-hole spin a/M. Use 0 for Schwarzschild, positive values for one spin orientation, and negative values for the opposite orientation.",
+    },
+    {
+        "key": "r_obs",
+        "label": "Observer Distance",
+        "kind": "float",
+        "description": "Observer distance from the black hole, measured in units of M. Larger values place the camera farther away and usually reduce the apparent distortion scale.",
+    },
+    {
+        "key": "psi_y",
+        "label": "Vertical Offset",
+        "kind": "float",
+        "description": "Vertical screen offset of the black hole in degrees. Positive values move it upward on screen and negative values move it downward.",
+    },
+    {
+        "key": "psi_x",
+        "label": "Horizontal Offset",
+        "kind": "float",
+        "description": "Horizontal screen offset of the black hole in degrees. Positive values move it to the right and negative values move it to the left.",
+    },
+    {
+        "key": "fov_v",
+        "label": "Vertical FOV",
+        "kind": "float",
+        "description": "Vertical field of view in degrees. Larger values show more of the sky at once, while smaller values zoom in; the horizontal FOV is derived from this and the aspect ratio.",
+    },
+    {
+        "key": "debug",
+        "label": "Debug",
+        "kind": "bool",
+        "description": "Show extra logging about the chosen metric, screen placement, tracing progress, and render behavior. Useful when diagnosing a setup.",
+    },
+    {
+        "key": "benchmark",
+        "label": "Benchmark",
+        "kind": "bool",
+        "description": "Print a timing summary after the render finishes, including per-stage runtimes and throughput estimates.",
+    },
     {
         "key": "wrap_outside_background_plane",
-        "label": "Wrap outside background plane (image)",
+        "label": "Wrap Outside Plane",
         "kind": "bool",
+        "description": "Image mode only. When a ray misses or lands behind the image plane, wrap it back onto the image with modulo indexing instead of using the normal miss fallback colors.",
     },
 ]
 
-ACTION_SPECS: list[tuple[str, str]] = [
-    ("run", "Run lensing"),
-    ("reset", "Reset defaults"),
-    ("quit", "Quit"),
+ACTION_SPECS: list[dict[str, str]] = [
+    {
+        "key": "run",
+        "label": "Run",
+        "description": "Validate the current settings, build the selected metric and background configuration, render the image, and save it to the output path.",
+    },
+    {
+        "key": "reset",
+        "label": "Reset",
+        "description": "Restore every form field to its built-in default value so you can start from a clean baseline again.",
+    },
+    {
+        "key": "quit",
+        "label": "Quit",
+        "description": "Leave the interactive CLI immediately and return to the terminal without starting a new render.",
+    },
 ]
 
 STAGE_SPECS: list[tuple[str, str, float]] = [
@@ -258,8 +352,8 @@ def parse_state(state: dict[str, Any]) -> tuple[AppConfig | None, str | None]:
 
     if m <= 0:
         return None, "BH mass must be > 0"
-    if abs(a) > m:
-        return None, "For Kerr metric, |a| must be <= M"
+    if abs(a) > 1.0:
+        return None, "Dimensionless BH spin a/M must be between -1 and 1"
     if r_obs <= 0:
         return None, "Observer distance must be > 0"
     if fov_v <= 0 or fov_v >= 179:
@@ -312,6 +406,7 @@ def is_enter_key(ch: Any) -> bool:
 def draw_form(
     stdscr: Any,
     state: dict[str, Any],
+    defaults: dict[str, Any],
     visible_fields: list[dict[str, str]],
     cursor: int,
     status: str,
@@ -332,36 +427,203 @@ def draw_form(
     stdscr.addnstr(0, 2, title, w - 4, curses.A_BOLD)
     stdscr.addnstr(1, 2, help_line, w - 4)
 
-    row = 3
-    for idx, spec in enumerate(visible_fields):
+    def format_display_value(spec: dict[str, str], values: dict[str, Any]) -> str:
         key = spec["key"]
-        label = spec["label"]
         kind = spec["kind"]
-
         if kind == "bool":
-            val_text = "[x]" if state[key] else "[ ]"
-        elif kind == "choice" and key == "source_mode":
-            mode_label = SOURCE_MODE_LABELS.get(str(state[key]), str(state[key]))
-            val_text = f"[ {mode_label} ]"
-        else:
-            val_text = f"[ {state[key]} ]"
+            return "On" if values[key] else "Off"
+        if kind == "choice" and key == "source_mode":
+            return SOURCE_MODE_LABELS.get(str(values[key]), str(values[key]))
+        return str(values[key])
 
-        line = f"{label:<30} {val_text}"
+    def truncate_for_column(text: str, width: int) -> str:
+        if width <= 0:
+            return ""
+        if len(text) <= width:
+            return text
+        if width <= 3:
+            return "." * width
+        return text[: width - 3] + "..."
+
+    def field_type_label(kind: str) -> str:
+        return {
+            "choice": "Choice",
+            "text": "Text",
+            "int": "Integer",
+            "float": "Float",
+            "bool": "Toggle",
+        }.get(kind, kind.title())
+
+    def field_scope_label(key: str) -> str:
+        if key in IMAGE_MODE_ONLY_FIELDS:
+            return "Image mode only"
+        if key in STRIPES_MODE_ONLY_FIELDS:
+            return "Stripes mode only"
+        return "All modes"
+
+    def field_constraint_text(key: str) -> str:
+        constraints = {
+            "source_mode": "Allowed values: image or stripes.",
+            "input_image": "Must point to an existing file when Mode is image.",
+            "output_image": "Cannot be empty. Existing files may be overwritten.",
+            "width": "Enter an integer greater than 0.",
+            "height": "Enter an integer greater than 0.",
+            "n_x": "Enter an integer greater than 0.",
+            "n_y": "Enter an integer greater than 0.",
+            "color_visualization": "Only changes the stripes renderer. Off keeps the normal stripe shading.",
+            "M": "Must be greater than 0.",
+            "a": "Enter the dimensionless spin a/M in the range [-1, 1].",
+            "r_obs": "Must be greater than 0 and is interpreted in units of M.",
+            "psi_y": "Measured in degrees on the screen. Positive is up.",
+            "psi_x": "Measured in degrees on the screen. Positive is right.",
+            "fov_v": "Enter a value strictly between 0 and 179 degrees.",
+            "debug": "Useful when you want metric setup and progress logs.",
+            "benchmark": "Adds a timing summary after the render completes.",
+            "wrap_outside_background_plane": "Ignored in stripes mode.",
+        }
+        return constraints.get(key, "")
+
+    min_name_w = 10
+    min_value_w = 8
+    max_value_w = 14
+    min_right_w = 24
+    left_x = 2
+    left_divider_gap = 2
+    right_divider_gap = 2
+    max_label_len = max(
+        [len("Name")]
+        + [len(spec["label"]) for spec in visible_fields]
+        + [len(action["label"]) for action in ACTION_SPECS]
+    )
+    max_value_len = max(
+        [len("Value")]
+        + [len(format_display_value(spec, state)) for spec in visible_fields]
+    )
+    desired_name_w = max(min_name_w, max_label_len)
+    desired_value_w = min(max_value_w, max(min_value_w, max_value_len))
+    max_left_w = max(
+        min_name_w + 2 + min_value_w,
+        w - min_right_w - (left_x + left_divider_gap + right_divider_gap + 3),
+    )
+    left_w = min(desired_name_w + 2 + desired_value_w, max_left_w)
+    name_w = min(desired_name_w, max(min_name_w, left_w - 2 - min_value_w))
+    value_w = min(desired_value_w, max(min_value_w, left_w - 2 - name_w))
+    left_w = name_w + 2 + value_w
+    divider_x = left_x + left_w + left_divider_gap
+    right_x = divider_x + 1 + right_divider_gap
+    right_w = max(16, w - right_x - 2)
+    value_x = left_x + name_w + 2
+
+    if cursor < len(visible_fields):
+        selected = visible_fields[cursor]
+        detail_title = selected["label"]
+        detail_default = format_display_value(selected, defaults)
+        detail_type = field_type_label(selected["kind"])
+        detail_scope = field_scope_label(selected["key"])
+        detail_constraints = field_constraint_text(selected["key"])
+        detail_description = selected["description"]
+        if selected["kind"] in {"bool", "choice"}:
+            detail_control = "Press Enter or Space to toggle this option."
+        else:
+            detail_control = "Press Enter to edit this value."
+    else:
+        selected_action = ACTION_SPECS[cursor - len(visible_fields)]
+        detail_title = selected_action["label"]
+        detail_default = ""
+        detail_type = "Action"
+        detail_scope = "Interactive form"
+        detail_constraints = ""
+        detail_description = selected_action["description"]
+        detail_control = "Press Enter to activate this action."
+
+    row = 3
+    stdscr.addnstr(row, left_x, "Options", left_w, curses.A_BOLD)
+    stdscr.addnstr(row, right_x, "Details", right_w, curses.A_BOLD)
+    row += 1
+    stdscr.addnstr(row, left_x, "Name", name_w, curses.A_DIM)
+    stdscr.addnstr(row, value_x, "Value", value_w, curses.A_DIM)
+    row += 1
+
+    for idx, spec in enumerate(visible_fields):
         attr = curses.A_REVERSE if idx == cursor else curses.A_NORMAL
-        stdscr.addnstr(row, 2, line, w - 4, attr)
+        stdscr.addnstr(row, left_x, truncate_for_column(spec["label"], name_w), name_w, attr)
+        stdscr.addnstr(
+            row,
+            value_x,
+            truncate_for_column(format_display_value(spec, state), value_w),
+            value_w,
+            attr,
+        )
         row += 1
 
     row += 1
-    stdscr.addnstr(row, 2, "Actions", w - 4, curses.A_BOLD)
+    stdscr.addnstr(row, left_x, "Actions", left_w, curses.A_BOLD)
     row += 1
 
     action_start = len(visible_fields)
-    for i, (_, label) in enumerate(ACTION_SPECS):
+    for i, action in enumerate(ACTION_SPECS):
         idx = action_start + i
-        line = f"[ {label} ]"
         attr = curses.A_REVERSE if idx == cursor else curses.A_NORMAL
-        stdscr.addnstr(row, 2, line, w - 4, attr)
+        stdscr.addnstr(row, left_x, truncate_for_column(action["label"], name_w), name_w, attr)
         row += 1
+
+    detail_bottom = row
+    stdscr.vline(3, divider_x, curses.ACS_VLINE, max(1, detail_bottom - 3))
+
+    detail_row = 5
+    for line in textwrap.wrap(f"Name: {detail_title}", width=max(12, right_w)):
+        if detail_row >= detail_bottom:
+            break
+        stdscr.addnstr(detail_row, right_x, line, right_w, curses.A_BOLD)
+        detail_row += 1
+
+    if detail_default and detail_row < detail_bottom:
+        detail_row += 1
+        for line in textwrap.wrap(f"Default value: {detail_default}", width=max(12, right_w)):
+            if detail_row >= detail_bottom:
+                break
+            stdscr.addnstr(detail_row, right_x, line, right_w)
+            detail_row += 1
+
+    if detail_row < detail_bottom:
+        detail_row += 1
+    for line in textwrap.wrap(f"Type: {detail_type}", width=max(12, right_w)):
+        if detail_row >= detail_bottom:
+            break
+        stdscr.addnstr(detail_row, right_x, line, right_w)
+        detail_row += 1
+
+    if detail_row < detail_bottom:
+        detail_row += 1
+    for line in textwrap.wrap(f"Applies to: {detail_scope}", width=max(12, right_w)):
+        if detail_row >= detail_bottom:
+            break
+        stdscr.addnstr(detail_row, right_x, line, right_w)
+        detail_row += 1
+
+    if detail_constraints and detail_row < detail_bottom:
+        detail_row += 1
+        for line in textwrap.wrap(f"Checks: {detail_constraints}", width=max(12, right_w)):
+            if detail_row >= detail_bottom:
+                break
+            stdscr.addnstr(detail_row, right_x, line, right_w)
+            detail_row += 1
+
+    if detail_row < detail_bottom:
+        detail_row += 1
+    for line in textwrap.wrap(f"Details: {detail_description}", width=max(12, right_w)):
+        if detail_row >= detail_bottom:
+            break
+        stdscr.addnstr(detail_row, right_x, line, right_w)
+        detail_row += 1
+
+    if detail_row < detail_bottom:
+        detail_row += 1
+    for line in textwrap.wrap(detail_control, width=max(12, right_w)):
+        if detail_row >= detail_bottom:
+            break
+        stdscr.addnstr(detail_row, right_x, line, right_w, curses.A_DIM)
+        detail_row += 1
 
     row += 1
     stdscr.addnstr(row, 2, "Output", w - 4, curses.A_BOLD)
@@ -475,7 +737,7 @@ def run_form(stdscr: Any, base_config: AppConfig) -> None:
 
     def redraw() -> None:
         visible_fields = get_visible_field_specs(state)
-        draw_form(stdscr, state, visible_fields, cursor, status, logs, run_info)
+        draw_form(stdscr, state, defaults, visible_fields, cursor, status, logs, run_info)
 
     def append_log(message: str) -> None:
         parts = message.splitlines() or [""]
@@ -545,7 +807,9 @@ def run_form(stdscr: Any, base_config: AppConfig) -> None:
             continue
 
         action_idx = cursor - len(visible_fields)
-        action_key, action_label = ACTION_SPECS[action_idx]
+        action_spec = ACTION_SPECS[action_idx]
+        action_key = action_spec["key"]
+        action_label = action_spec["label"]
 
         if action_key == "quit":
             return
@@ -668,6 +932,17 @@ def overall_progress_percent(stage_key: str, stage_fraction: float) -> float:
     return max(0.0, min(100.0, total * 100.0))
 
 
+def spin_mass_units_to_kerr_a(M: float, spin_over_mass: float) -> float:
+    return float(M) * float(spin_over_mass)
+
+
+def metric_spin_over_mass(metric: Any) -> float:
+    metric_mass = float(getattr(metric, "M", 0.0))
+    if np.isclose(metric_mass, 0.0):
+        return 0.0
+    return float(getattr(metric, "a", 0.0)) / metric_mass
+
+
 def run_lensing(
     config: AppConfig,
     log: Callable[[str], None] | None = None,
@@ -692,7 +967,11 @@ def run_lensing(
         stage_pct = max(0.0, min(100.0, stage_fraction * 100.0))
         progress(STAGE_LABELS[stage_key], stage_pct, overall_progress_percent(stage_key, stage_fraction))
 
-    metric = Schwarzschild(M=config.M) if np.isclose(config.a, 0.0) else Kerr(M=config.M, a=config.a)
+    metric = (
+        Schwarzschild(M=config.M)
+        if np.isclose(config.a, 0.0)
+        else Kerr(M=config.M, a=spin_mass_units_to_kerr_a(config.M, config.a))
+    )
 
     timings: dict[str, float] = {}
     total_start = perf_counter() if config.benchmark else None
@@ -705,7 +984,11 @@ def run_lensing(
             timings[key] = perf_counter() - start_time
 
     if config.debug:
-        emit(f"Metric: {type(metric).__name__} (M={metric.M}, a={getattr(metric, 'a', 0.0)})")
+        emit(
+            f"Metric: {type(metric).__name__} "
+            f"(M={metric.M}, a/M={metric_spin_over_mass(metric):g}, "
+            f"a={getattr(metric, 'a', 0.0):g})"
+        )
 
     emit_progress("prepare_source", 0.0)
     stage_start = bench_start()
@@ -945,7 +1228,7 @@ def build_parser() -> argparse.ArgumentParser:
               "remaining escaped rays by final theta quadrant"),
     )
     parser.add_argument("--M", type=float, default=1.0, help="BH mass")
-    parser.add_argument("--a", type=float, default=0.0, help="BH spin (|a| <= M)")
+    parser.add_argument("--a", type=float, default=0.0, help="Dimensionless BH spin a/M (-1 <= a/M <= 1)")
     parser.add_argument("--r-obs", type=float, default=100.0, help="Observer distance in units of M")
     parser.add_argument("--psi-y", type=float, default=0.0, help="BH vertical offset in deg")
     parser.add_argument("--psi-x", type=float, default=0.0, help="BH horizontal offset in deg")
