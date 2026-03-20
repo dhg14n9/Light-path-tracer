@@ -468,8 +468,8 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
     r_capture = r_plus * 1.01
     r_escape = r_obs * 2.0
 
-    atol = 1e-10 if axis_refine else 1e-8
-    rtol = 1e-8 if axis_refine else 1e-6
+    atol = 1e-12 if axis_refine else 1e-10
+    rtol = 1e-10 if axis_refine else 1e-8
 
     # Working arrays: 7 stages (FSAL) + scratch — 5D
     k1 = np.empty(5, dtype=np.float64)
@@ -599,9 +599,9 @@ def _kerr_trace_ray_numba(M, a, r_plus, r_obs, alpha, theta, theta_obs,
 
         # Grow h for next step
         if err_norm < 1e-10:
-            h *= 5.0
+            h *= 2.5
         else:
-            h *= min(5.0, 0.9 * err_norm ** (-0.2))
+            h *= min(2.5, 0.9 * err_norm ** (-0.2))
 
     return _kerr_extract_direction(state, p_t, p_phi, M, a, r_capture,
                                    event_status)

@@ -534,6 +534,7 @@ def render_color_visualization(final_theta_lookup, ends_on_stripe_lookup):
     colors[blue] = (0.0, 0.0, 1.0)
     colors[green] = (0.0, 1.0, 0.0)
     colors[yellow] = (1.0, 1.0, 0.0)
+    # Stripe hits stay black (already zeros)
     return colors
 
 
