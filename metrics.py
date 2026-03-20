@@ -735,6 +735,17 @@ def _trace_rays_batch_kerr(M, a, r_plus, r_obs, alphas, thetas, theta_obs,
 
 
 @njit(parallel=True, cache=True)
+def _trace_rays_batch_kerr_status(M, a, r_plus, r_obs, alphas, thetas,
+                                  theta_obs, lambda_max, axis_refines,
+                                  out_status):
+    for i in prange(alphas.shape[0]):
+        s, _, _, _, _, _ = _kerr_trace_ray_numba(
+            M, a, r_plus, r_obs, alphas[i], thetas[i], theta_obs,
+            lambda_max, 1.0, axis_refines[i])
+        out_status[i] = s
+
+
+@njit(parallel=True, cache=True)
 def _trace_rays_batch_kerr_with_dir(M, a, r_plus, r_obs, alphas, thetas,
                                     theta_obs, lambda_max, axis_refines,
                                     out_fa, out_w, out_vx, out_vy, out_vz):
@@ -1206,6 +1217,12 @@ class Kerr(Metric):
         _trace_rays_batch_kerr(
             self.M, self.a, self.r_plus, r_obs, alphas, thetas, theta_obs,
             max(5000.0, 6.0 * r_obs), axis_refines, out_fa, out_w)
+
+    def trace_rays_batch_status(self, r_obs, alphas, thetas, theta_obs,
+                                axis_refines, out_status):
+        _trace_rays_batch_kerr_status(
+            self.M, self.a, self.r_plus, r_obs, alphas, thetas, theta_obs,
+            max(5000.0, 6.0 * r_obs), axis_refines, out_status)
 
     def trace_rays_batch_with_dir(self, r_obs, alphas, thetas, theta_obs,
                                   axis_refines, out_fa, out_w,

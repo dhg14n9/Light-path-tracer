@@ -29,6 +29,7 @@ from image_lens import (
     render_lensed_image as render_lensed_input_image,
 )
 from metrics import Kerr, Schwarzschild
+from solid_angle import kerr_shadow_solid_angle, schwarzschild_shadow_solid_angle
 from stripes_lens import (
     DEFAULT_IMAGE_DIMENSION as DEFAULT_STRIPES_IMAGE_DIMENSION,
     DEFAULT_N_X,
@@ -41,7 +42,10 @@ from stripes_lens import (
 
 @dataclass
 class AppConfig:
+    operation_mode: str = "lensing"
     source_mode: str = "image"
+    shadow_metric: str = "kerr"
+    solid_angle_profile: str = "normal"
     input_image: str = "image.jpg"
     output_image: str = "lensed_image.png"
     width: int = DEFAULT_STRIPES_IMAGE_DIMENSION[1]
@@ -52,9 +56,15 @@ class AppConfig:
     M: float = 1.0
     a: float = 0.0
     r_obs: float = 100.0
+    theta_obs_deg: float = 90.0
     psi_y: float = 0.0
     psi_x: float = 0.0
     fov_v: float = 40.0
+    solid_angle_base_n_alpha: int = 48
+    solid_angle_base_n_theta: int = 96
+    solid_angle_refine_levels: int = 4
+    solid_angle_edge_samples: int = 4
+    solid_angle_chunk: int = 50_000
     debug: bool = False
     benchmark: bool = False
     wrap_outside_background_plane: bool = False
@@ -62,10 +72,28 @@ class AppConfig:
 
 FIELD_SPECS: list[dict[str, str]] = [
     {
-        "key": "source_mode",
+        "key": "operation_mode",
         "label": "Mode",
         "kind": "choice",
+        "description": "Choose whether to render a lensed image or compute the black-hole shadow solid angle directly.",
+    },
+    {
+        "key": "source_mode",
+        "label": "Background Mode",
+        "kind": "choice",
         "description": "Choose which background the black hole lenses. Image mode samples pixels from an input file, while stripes mode uses the procedural spherical stripe pattern.",
+    },
+    {
+        "key": "shadow_metric",
+        "label": "Shadow Metric",
+        "kind": "choice",
+        "description": "Choose which shadow solid-angle function to use. Schwarzschild uses the analytic circular-cap formula, while Kerr uses the adaptive numerical sky integral.",
+    },
+    {
+        "key": "solid_angle_profile",
+        "label": "SA Profile",
+        "kind": "choice",
+        "description": "Kerr shadow mode only. Load a preset for the adaptive Kerr solid-angle integrator. Quick is fastest and roughest, Normal is the default balance, Accurate spends more work on the shadow boundary, and Ultra Accurate pushes the integration settings further. You can still edit the individual solid-angle settings afterward.",
     },
     {
         "key": "input_image",
@@ -128,6 +156,12 @@ FIELD_SPECS: list[dict[str, str]] = [
         "description": "Observer distance from the black hole, measured in units of M. Larger values place the camera farther away and usually reduce the apparent distortion scale.",
     },
     {
+        "key": "theta_obs_deg",
+        "label": "Observer Inclination",
+        "kind": "float",
+        "description": "Observer polar angle in degrees, measured from the black-hole spin axis. Use 90 for the equatorial view; values near 0 or 180 look close to the poles.",
+    },
+    {
         "key": "psi_y",
         "label": "Vertical Offset",
         "kind": "float",
@@ -144,6 +178,36 @@ FIELD_SPECS: list[dict[str, str]] = [
         "label": "Vertical FOV",
         "kind": "float",
         "description": "Vertical field of view in degrees. Larger values show more of the sky at once, while smaller values zoom in; the horizontal FOV is derived from this and the aspect ratio.",
+    },
+    {
+        "key": "solid_angle_base_n_alpha",
+        "label": "SA Base Alpha",
+        "kind": "int",
+        "description": "Kerr shadow mode only. Number of coarse cells in polar angle alpha before adaptive refinement begins.",
+    },
+    {
+        "key": "solid_angle_base_n_theta",
+        "label": "SA Base Theta",
+        "kind": "int",
+        "description": "Kerr shadow mode only. Number of coarse cells in azimuthal sky angle theta before adaptive refinement begins.",
+    },
+    {
+        "key": "solid_angle_refine_levels",
+        "label": "SA Refine Levels",
+        "kind": "int",
+        "description": "Kerr shadow mode only. Number of adaptive refinement rounds applied to cells that straddle the shadow boundary.",
+    },
+    {
+        "key": "solid_angle_edge_samples",
+        "label": "SA Edge Samples",
+        "kind": "int",
+        "description": "Kerr shadow mode only. Terminal subgrid resolution per side for the final mixed edge cells.",
+    },
+    {
+        "key": "solid_angle_chunk",
+        "label": "SA Chunk Size",
+        "kind": "int",
+        "description": "Kerr shadow mode only. Number of sample rays to trace per batch during solid-angle integration.",
     },
     {
         "key": "debug",
@@ -169,7 +233,7 @@ ACTION_SPECS: list[dict[str, str]] = [
     {
         "key": "run",
         "label": "Run",
-        "description": "Validate the current settings, build the selected metric and background configuration, render the image, and save it to the output path.",
+        "description": "Validate the current settings and run the selected mode. Lensing mode renders an image, while shadow solid angle mode computes and prints the shadow area on the observer sky.",
     },
     {
         "key": "reset",
@@ -191,9 +255,92 @@ STAGE_SPECS: list[tuple[str, str, float]] = [
     ("save_image", "Save image", 0.05),
 ]
 STAGE_LABELS = {key: label for key, label, _ in STAGE_SPECS}
+OPERATION_MODE_LABELS = {
+    "lensing": "Lensing",
+    "shadow_solid_angle": "Shadow Solid Angle",
+}
 SOURCE_MODE_LABELS = {
-    "image": "Normal",
+    "image": "Image",
     "stripes": "Stripes",
+}
+SHADOW_METRIC_LABELS = {
+    "kerr": "Kerr",
+    "schwarzschild": "Schwarzschild",
+}
+SOLID_ANGLE_PROFILE_LABELS = {
+    "quick": "Quick",
+    "normal": "Normal",
+    "accurate": "Accurate",
+    "ultra_accurate": "Ultra Accurate",
+}
+CHOICE_VALUES: dict[str, tuple[str, ...]] = {
+    "operation_mode": ("lensing", "shadow_solid_angle"),
+    "source_mode": ("image", "stripes"),
+    "shadow_metric": ("kerr", "schwarzschild"),
+    "solid_angle_profile": ("quick", "normal", "accurate", "ultra_accurate"),
+}
+KERR_SOLID_ANGLE_PROFILE_PRESETS: dict[str, dict[str, int]] = {
+    "quick": {
+        "solid_angle_base_n_alpha": 24,
+        "solid_angle_base_n_theta": 48,
+        "solid_angle_refine_levels": 2,
+        "solid_angle_edge_samples": 2,
+        "solid_angle_chunk": 20_000,
+    },
+    "normal": {
+        "solid_angle_base_n_alpha": 48,
+        "solid_angle_base_n_theta": 96,
+        "solid_angle_refine_levels": 4,
+        "solid_angle_edge_samples": 4,
+        "solid_angle_chunk": 50_000,
+    },
+    "accurate": {
+        "solid_angle_base_n_alpha": 96,
+        "solid_angle_base_n_theta": 192,
+        "solid_angle_refine_levels": 5,
+        "solid_angle_edge_samples": 6,
+        "solid_angle_chunk": 50_000,
+    },
+    "ultra_accurate": {
+        "solid_angle_base_n_alpha": 160,
+        "solid_angle_base_n_theta": 320,
+        "solid_angle_refine_levels": 6,
+        "solid_angle_edge_samples": 8,
+        "solid_angle_chunk": 50_000,
+    },
+}
+LENSING_ONLY_FIELDS = {
+    "source_mode",
+    "input_image",
+    "output_image",
+    "width",
+    "height",
+    "n_x",
+    "n_y",
+    "color_visualization",
+    "psi_y",
+    "psi_x",
+    "fov_v",
+    "wrap_outside_background_plane",
+}
+SHADOW_ONLY_FIELDS = {
+    "shadow_metric",
+    "solid_angle_profile",
+    "solid_angle_base_n_alpha",
+    "solid_angle_base_n_theta",
+    "solid_angle_refine_levels",
+    "solid_angle_edge_samples",
+    "solid_angle_chunk",
+}
+SHADOW_KERR_ONLY_FIELDS = {
+    "solid_angle_profile",
+    "a",
+    "theta_obs_deg",
+    "solid_angle_base_n_alpha",
+    "solid_angle_base_n_theta",
+    "solid_angle_refine_levels",
+    "solid_angle_edge_samples",
+    "solid_angle_chunk",
 }
 IMAGE_MODE_ONLY_FIELDS = {
     "input_image",
@@ -208,19 +355,114 @@ STRIPES_MODE_ONLY_FIELDS = {
 }
 
 
-def toggle_source_mode(value: str) -> str:
-    return "stripes" if value == "image" else "image"
+def toggle_choice(key: str, value: str) -> str:
+    options = CHOICE_VALUES.get(key)
+    if options is None:
+        return value
+    try:
+        idx = options.index(value)
+    except ValueError:
+        return options[0]
+    return options[(idx + 1) % len(options)]
+
+
+def solid_angle_profile_preset(profile: str) -> dict[str, int]:
+    preset = KERR_SOLID_ANGLE_PROFILE_PRESETS.get(profile)
+    if preset is None:
+        preset = KERR_SOLID_ANGLE_PROFILE_PRESETS["normal"]
+    return dict(preset)
+
+
+def apply_solid_angle_profile_to_state(state: dict[str, Any], profile: str) -> None:
+    for key, value in solid_angle_profile_preset(profile).items():
+        state[key] = f"{value:d}"
+
+
+def apply_choice_change(state: dict[str, Any], key: str, label: str | None = None) -> str:
+    next_value = toggle_choice(key, str(state[key]))
+    state[key] = next_value
+    name = label if label is not None else key
+    if key == "solid_angle_profile":
+        apply_solid_angle_profile_to_state(state, next_value)
+        return (
+            f"{name} set to {format_choice_value(key, next_value)} "
+            "and Kerr solid-angle settings updated."
+        )
+    return f"{name} set to {format_choice_value(key, next_value)}"
+
+
+def choice_label_map(key: str) -> dict[str, str]:
+    if key == "operation_mode":
+        return OPERATION_MODE_LABELS
+    if key == "source_mode":
+        return SOURCE_MODE_LABELS
+    if key == "shadow_metric":
+        return SHADOW_METRIC_LABELS
+    if key == "solid_angle_profile":
+        return SOLID_ANGLE_PROFILE_LABELS
+    return {}
+
+
+def format_choice_value(key: str, value: str) -> str:
+    return choice_label_map(key).get(value, value)
+
+
+FIELD_UNIT_SUFFIXES: dict[str, str] = {
+    "width": "px",
+    "height": "px",
+    "n_x": "stripes",
+    "n_y": "stripes",
+    "M": "M",
+    "a": "a/M",
+    "r_obs": "M",
+    "theta_obs_deg": "deg",
+    "psi_y": "deg",
+    "psi_x": "deg",
+    "fov_v": "deg",
+    "solid_angle_base_n_alpha": "alpha bins",
+    "solid_angle_base_n_theta": "theta bins",
+    "solid_angle_refine_levels": "levels",
+    "solid_angle_edge_samples": "samples/side",
+    "solid_angle_chunk": "rays/chunk",
+}
+
+
+def append_unit(value: Any, unit: str | None) -> str:
+    text = str(value).strip()
+    if not text or unit is None:
+        return text
+    if text == unit or text.endswith(f" {unit}"):
+        return text
+    return f"{text} {unit}"
+
+
+def format_field_value(key: str, value: Any) -> str:
+    return append_unit(value, FIELD_UNIT_SUFFIXES.get(key))
+
+
+def format_resolution_value(width: int, height: int) -> str:
+    return f"{append_unit(width, 'px')} x {append_unit(height, 'px')}"
 
 
 def get_visible_field_specs(state: dict[str, Any]) -> list[dict[str, str]]:
+    operation_mode = str(state.get("operation_mode", "lensing")).strip().lower()
     source_mode = str(state.get("source_mode", "image")).strip().lower()
+    shadow_metric = str(state.get("shadow_metric", "kerr")).strip().lower()
     visible: list[dict[str, str]] = []
     for spec in FIELD_SPECS:
         key = spec["key"]
-        if source_mode == "image" and key in STRIPES_MODE_ONLY_FIELDS:
-            continue
-        if source_mode == "stripes" and key in IMAGE_MODE_ONLY_FIELDS:
-            continue
+        if operation_mode == "lensing":
+            if key in SHADOW_ONLY_FIELDS:
+                continue
+            if source_mode == "image" and key in STRIPES_MODE_ONLY_FIELDS:
+                continue
+            if source_mode == "stripes" and key in IMAGE_MODE_ONLY_FIELDS:
+                continue
+        else:
+            if key in LENSING_ONLY_FIELDS:
+                continue
+            if shadow_metric == "schwarzschild" and key in SHADOW_KERR_ONLY_FIELDS:
+                continue
         visible.append(spec)
     return visible
 
@@ -275,7 +517,10 @@ class ProcessUsageSampler:
 
 def config_to_state(config: AppConfig) -> dict[str, Any]:
     return {
+        "operation_mode": config.operation_mode,
         "source_mode": config.source_mode,
+        "shadow_metric": config.shadow_metric,
+        "solid_angle_profile": config.solid_angle_profile,
         "input_image": config.input_image,
         "output_image": config.output_image,
         "width": f"{config.width:d}",
@@ -286,16 +531,25 @@ def config_to_state(config: AppConfig) -> dict[str, Any]:
         "M": f"{config.M:g}",
         "a": f"{config.a:g}",
         "r_obs": f"{config.r_obs:g}",
+        "theta_obs_deg": f"{config.theta_obs_deg:g}",
         "psi_y": f"{config.psi_y:g}",
         "psi_x": f"{config.psi_x:g}",
         "fov_v": f"{config.fov_v:g}",
+        "solid_angle_base_n_alpha": f"{config.solid_angle_base_n_alpha:d}",
+        "solid_angle_base_n_theta": f"{config.solid_angle_base_n_theta:d}",
+        "solid_angle_refine_levels": f"{config.solid_angle_refine_levels:d}",
+        "solid_angle_edge_samples": f"{config.solid_angle_edge_samples:d}",
+        "solid_angle_chunk": f"{config.solid_angle_chunk:d}",
         "debug": bool(config.debug),
         "benchmark": bool(config.benchmark),
         "wrap_outside_background_plane": bool(config.wrap_outside_background_plane),
     }
 
 
-def parse_state(state: dict[str, Any]) -> tuple[AppConfig | None, str | None]:
+def parse_state(
+    state: dict[str, Any],
+    require_source_assets: bool = True,
+) -> tuple[AppConfig | None, str | None]:
     def parse_float(key: str, name: str) -> tuple[float | None, str | None]:
         raw = str(state[key]).strip()
         try:
@@ -310,9 +564,22 @@ def parse_state(state: dict[str, Any]) -> tuple[AppConfig | None, str | None]:
         except ValueError:
             return None, f"{name} must be an integer"
 
+    operation_mode = str(state["operation_mode"]).strip().lower()
+    if operation_mode not in {"lensing", "shadow_solid_angle"}:
+        return None, "Mode must be either 'lensing' or 'shadow_solid_angle'"
+
     source_mode = str(state["source_mode"]).strip().lower()
     if source_mode not in {"image", "stripes"}:
         return None, "Source mode must be either 'image' or 'stripes'"
+    shadow_metric = str(state["shadow_metric"]).strip().lower()
+    if shadow_metric not in {"kerr", "schwarzschild"}:
+        return None, "Shadow metric must be either 'kerr' or 'schwarzschild'"
+    solid_angle_profile = str(state["solid_angle_profile"]).strip().lower()
+    if solid_angle_profile not in {"quick", "normal", "accurate", "ultra_accurate"}:
+        return None, (
+            "Solid-angle profile must be one of 'quick', 'normal', "
+            "'accurate', or 'ultra_accurate'"
+        )
 
     m, err = parse_float("M", "BH mass")
     if err:
@@ -321,6 +588,9 @@ def parse_state(state: dict[str, Any]) -> tuple[AppConfig | None, str | None]:
     if err:
         return None, err
     r_obs, err = parse_float("r_obs", "Observer distance")
+    if err:
+        return None, err
+    theta_obs_deg, err = parse_float("theta_obs_deg", "Observer inclination")
     if err:
         return None, err
     psi_y, err = parse_float("psi_y", "Vertical offset")
@@ -344,32 +614,88 @@ def parse_state(state: dict[str, Any]) -> tuple[AppConfig | None, str | None]:
     n_y, err = parse_int("n_y", "Horizontal stripe count")
     if err:
         return None, err
+    solid_angle_base_n_alpha, err = parse_int(
+        "solid_angle_base_n_alpha", "Solid-angle base alpha"
+    )
+    if err:
+        return None, err
+    solid_angle_base_n_theta, err = parse_int(
+        "solid_angle_base_n_theta", "Solid-angle base theta"
+    )
+    if err:
+        return None, err
+    solid_angle_refine_levels, err = parse_int(
+        "solid_angle_refine_levels", "Solid-angle refine levels"
+    )
+    if err:
+        return None, err
+    solid_angle_edge_samples, err = parse_int(
+        "solid_angle_edge_samples", "Solid-angle edge samples"
+    )
+    if err:
+        return None, err
+    solid_angle_chunk, err = parse_int(
+        "solid_angle_chunk", "Solid-angle chunk size"
+    )
+    if err:
+        return None, err
 
     assert m is not None and a is not None and r_obs is not None
+    assert theta_obs_deg is not None
     assert psi_y is not None and psi_x is not None and fov_v is not None
     assert width is not None and height is not None
     assert n_x is not None and n_y is not None
+    assert solid_angle_base_n_alpha is not None and solid_angle_base_n_theta is not None
+    assert solid_angle_refine_levels is not None
+    assert solid_angle_edge_samples is not None and solid_angle_chunk is not None
 
     if m <= 0:
         return None, "BH mass must be > 0"
-    if abs(a) > 1.0:
-        return None, "Dimensionless BH spin a/M must be between -1 and 1"
     if r_obs <= 0:
         return None, "Observer distance must be > 0"
-    if fov_v <= 0 or fov_v >= 179:
-        return None, "Vertical FOV must be in (0, 179) degrees"
-    if width <= 0 or height <= 0:
-        return None, "Output width and height must both be > 0"
-    if n_x <= 0 or n_y <= 0:
-        return None, "Stripe counts must both be > 0"
+    if operation_mode == "lensing":
+        if abs(a) > 1.0:
+            return None, "Dimensionless BH spin a/M must be between -1 and 1"
+        if theta_obs_deg < 0 or theta_obs_deg > 180:
+            return None, "Observer inclination must be in [0, 180] degrees"
+        if not np.isclose(a, 0.0) and np.isclose(np.sin(np.radians(theta_obs_deg)), 0.0):
+            return None, (
+                "For Kerr, observer inclination must avoid exact 0 or 180 degrees "
+                "with the current tracer"
+            )
+        if fov_v <= 0 or fov_v >= 179:
+            return None, "Vertical FOV must be in (0, 179) degrees"
+        if width <= 0 or height <= 0:
+            return None, "Output width and height must both be > 0"
+        if n_x <= 0 or n_y <= 0:
+            return None, "Stripe counts must both be > 0"
+    else:
+        if shadow_metric == "kerr":
+            if abs(a) > 1.0:
+                return None, "Dimensionless Kerr spin a/M must be between -1 and 1"
+            if theta_obs_deg < 0 or theta_obs_deg > 180:
+                return None, "Observer inclination must be in [0, 180] degrees"
+            if np.isclose(np.sin(np.radians(theta_obs_deg)), 0.0):
+                return None, (
+                    "For Kerr, observer inclination must avoid exact 0 or 180 degrees "
+                    "with the current tracer"
+                )
+            if solid_angle_base_n_alpha <= 0 or solid_angle_base_n_theta <= 0:
+                return None, "Solid-angle base grid sizes must be > 0"
+            if solid_angle_refine_levels < 0:
+                return None, "Solid-angle refine levels must be >= 0"
+            if solid_angle_edge_samples <= 0:
+                return None, "Solid-angle edge samples must be > 0"
+            if solid_angle_chunk <= 0:
+                return None, "Solid-angle chunk size must be > 0"
 
     input_image = str(state["input_image"]).strip()
     output_image = str(state["output_image"]).strip()
 
-    if not output_image:
+    if operation_mode == "lensing" and not output_image:
         return None, "Output image path cannot be empty"
 
-    if source_mode == "image":
+    if operation_mode == "lensing" and require_source_assets and source_mode == "image":
         if not input_image:
             return None, "Background image path cannot be empty in image mode"
         input_path = Path(input_image).expanduser()
@@ -377,7 +703,10 @@ def parse_state(state: dict[str, Any]) -> tuple[AppConfig | None, str | None]:
             return None, f"Background image not found: {input_path}"
 
     return AppConfig(
+        operation_mode=operation_mode,
         source_mode=source_mode,
+        shadow_metric=shadow_metric,
+        solid_angle_profile=solid_angle_profile,
         input_image=input_image,
         output_image=output_image,
         width=width,
@@ -388,9 +717,15 @@ def parse_state(state: dict[str, Any]) -> tuple[AppConfig | None, str | None]:
         M=m,
         a=a,
         r_obs=r_obs,
+        theta_obs_deg=theta_obs_deg,
         psi_y=psi_y,
         psi_x=psi_x,
         fov_v=fov_v,
+        solid_angle_base_n_alpha=solid_angle_base_n_alpha,
+        solid_angle_base_n_theta=solid_angle_base_n_theta,
+        solid_angle_refine_levels=solid_angle_refine_levels,
+        solid_angle_edge_samples=solid_angle_edge_samples,
+        solid_angle_chunk=solid_angle_chunk,
         debug=bool(state["debug"]),
         benchmark=bool(state["benchmark"]),
         wrap_outside_background_plane=bool(state["wrap_outside_background_plane"]),
@@ -423,7 +758,7 @@ def draw_form(
         return
 
     title = "Lens CLI Wrapper"
-    help_line = "Arrows or j/k: move | Enter: edit/toggle | Space: toggle | q: quit"
+    help_line = "Arrows or j/k: move | Enter: edit/cycle | Space: toggle/cycle | q: quit"
     stdscr.addnstr(0, 2, title, w - 4, curses.A_BOLD)
     stdscr.addnstr(1, 2, help_line, w - 4)
 
@@ -432,9 +767,9 @@ def draw_form(
         kind = spec["kind"]
         if kind == "bool":
             return "On" if values[key] else "Off"
-        if kind == "choice" and key == "source_mode":
-            return SOURCE_MODE_LABELS.get(str(values[key]), str(values[key]))
-        return str(values[key])
+        if kind == "choice":
+            return format_choice_value(key, str(values[key]))
+        return format_field_value(key, values[key])
 
     def truncate_for_column(text: str, width: int) -> str:
         if width <= 0:
@@ -455,17 +790,26 @@ def draw_form(
         }.get(kind, kind.title())
 
     def field_scope_label(key: str) -> str:
+        if key in SHADOW_KERR_ONLY_FIELDS:
+            return "Shadow mode / Kerr only"
+        if key in LENSING_ONLY_FIELDS:
+            return "Lensing mode only"
+        if key in SHADOW_ONLY_FIELDS:
+            return "Shadow mode only"
         if key in IMAGE_MODE_ONLY_FIELDS:
-            return "Image mode only"
+            return "Lensing / image background only"
         if key in STRIPES_MODE_ONLY_FIELDS:
-            return "Stripes mode only"
+            return "Lensing / stripes background only"
         return "All modes"
 
     def field_constraint_text(key: str) -> str:
         constraints = {
+            "operation_mode": "Allowed values: lensing or shadow_solid_angle.",
             "source_mode": "Allowed values: image or stripes.",
+            "shadow_metric": "Allowed values: kerr or schwarzschild.",
+            "solid_angle_profile": "Allowed values: quick, normal, accurate, or ultra_accurate. Selecting one loads the corresponding Kerr integration preset.",
             "input_image": "Must point to an existing file when Mode is image.",
-            "output_image": "Cannot be empty. Existing files may be overwritten.",
+            "output_image": "Lensing mode only. Cannot be empty. Existing files may be overwritten.",
             "width": "Enter an integer greater than 0.",
             "height": "Enter an integer greater than 0.",
             "n_x": "Enter an integer greater than 0.",
@@ -474,9 +818,15 @@ def draw_form(
             "M": "Must be greater than 0.",
             "a": "Enter the dimensionless spin a/M in the range [-1, 1].",
             "r_obs": "Must be greater than 0 and is interpreted in units of M.",
+            "theta_obs_deg": "Measured from the spin axis in degrees. Use 90 for equatorial viewing.",
             "psi_y": "Measured in degrees on the screen. Positive is up.",
             "psi_x": "Measured in degrees on the screen. Positive is right.",
             "fov_v": "Enter a value strictly between 0 and 179 degrees.",
+            "solid_angle_base_n_alpha": "Kerr shadow mode only. Enter an integer greater than 0.",
+            "solid_angle_base_n_theta": "Kerr shadow mode only. Enter an integer greater than 0.",
+            "solid_angle_refine_levels": "Kerr shadow mode only. Enter an integer greater than or equal to 0.",
+            "solid_angle_edge_samples": "Kerr shadow mode only. Enter an integer greater than 0.",
+            "solid_angle_chunk": "Kerr shadow mode only. Enter an integer greater than 0.",
             "debug": "Useful when you want metric setup and progress logs.",
             "benchmark": "Adds a timing summary after the render completes.",
             "wrap_outside_background_plane": "Ignored in stripes mode.",
@@ -485,7 +835,7 @@ def draw_form(
 
     min_name_w = 10
     min_value_w = 8
-    max_value_w = 14
+    max_value_w = 20  # Fits the longest choice label, "Shadow Solid Angle".
     min_right_w = 24
     left_x = 2
     left_divider_gap = 2
@@ -523,7 +873,7 @@ def draw_form(
         detail_constraints = field_constraint_text(selected["key"])
         detail_description = selected["description"]
         if selected["kind"] in {"bool", "choice"}:
-            detail_control = "Press Enter or Space to toggle this option."
+            detail_control = "Press Enter or Space to cycle this option."
         else:
             detail_control = "Press Enter to edit this value."
     else:
@@ -733,7 +1083,7 @@ def run_form(stdscr: Any, base_config: AppConfig) -> None:
     }
 
     cursor = 0
-    status = "Edit values and choose Run lensing."
+    status = "Edit values and choose Run."
 
     def redraw() -> None:
         visible_fields = get_visible_field_specs(state)
@@ -776,9 +1126,8 @@ def run_form(stdscr: Any, base_config: AppConfig) -> None:
                 if spec["kind"] == "bool":
                     state[key] = not state[key]
                     status = f"{spec['label']} set to {state[key]}"
-                elif spec["kind"] == "choice" and key == "source_mode":
-                    state[key] = toggle_source_mode(str(state[key]))
-                    status = f"{spec['label']} set to {SOURCE_MODE_LABELS[state[key]]}"
+                elif spec["kind"] == "choice":
+                    status = apply_choice_change(state, key, spec["label"])
             continue
 
         if not is_enter_key(ch):
@@ -793,9 +1142,8 @@ def run_form(stdscr: Any, base_config: AppConfig) -> None:
                 state[key] = not state[key]
                 status = f"{spec['label']} set to {state[key]}"
                 continue
-            if kind == "choice" and key == "source_mode":
-                state[key] = toggle_source_mode(str(state[key]))
-                status = f"{spec['label']} set to {SOURCE_MODE_LABELS[state[key]]}"
+            if kind == "choice":
+                status = apply_choice_change(state, key, spec["label"])
                 continue
 
             new_value = prompt_input(stdscr, spec["label"], str(state[key]))
@@ -821,28 +1169,54 @@ def run_form(stdscr: Any, base_config: AppConfig) -> None:
             continue
 
         if action_key == "run":
-            config, err = parse_state(state)
+            config, err = parse_state(
+                state,
+                require_source_assets=(
+                    str(state.get("operation_mode", "lensing")).strip().lower() == "lensing"
+                ),
+            )
             if err:
                 status = f"Validation error: {err}"
                 continue
             logs.clear()
             status = f"Running: {action_label}..."
-            append_log(f"Starting run in '{config.source_mode}' mode")
-            if config.source_mode == "image":
-                append_log(f"Using input '{config.input_image}'")
+            append_log(f"Starting run in '{OPERATION_MODE_LABELS[config.operation_mode]}' mode")
+            if config.operation_mode == "lensing":
+                append_log(f"Background mode: {SOURCE_MODE_LABELS[config.source_mode]}")
+                if config.source_mode == "image":
+                    append_log(f"Using input '{config.input_image}'")
+                else:
+                    append_log(
+                        f"Using stripes at {format_resolution_value(config.width, config.height)} "
+                        f"(n_x={append_unit(config.n_x, 'stripes')}, "
+                        f"n_y={append_unit(config.n_y, 'stripes')})"
+                    )
+                    if config.color_visualization:
+                        append_log(
+                            "Color visualization will render stripe hits in black "
+                            "and color the remaining escaped rays by final theta "
+                            "quadrant."
+                        )
+                append_log(f"Output will be saved to '{config.output_image}'")
+                run_info["stage_label"] = "Preparing"
             else:
                 append_log(
-                    f"Using stripes at {config.width}x{config.height} "
-                    f"(n_x={config.n_x}, n_y={config.n_y})"
+                    f"Using {SHADOW_METRIC_LABELS[config.shadow_metric]} "
+                    f"with M={append_unit(config.M, 'M')}, "
+                    f"r_obs={append_unit(config.r_obs, 'M')}"
                 )
-                if config.color_visualization:
+                if config.shadow_metric == "kerr":
                     append_log(
-                        "Color visualization will render stripe hits in black "
-                        "and color the remaining escaped rays by final theta "
-                        "quadrant."
+                        f"profile={format_choice_value('solid_angle_profile', config.solid_angle_profile)}, "
+                        f"spin={append_unit(config.a, 'a/M')}, "
+                        f"theta_obs={append_unit(config.theta_obs_deg, 'deg')}, "
+                        f"grid={format_field_value('solid_angle_base_n_alpha', config.solid_angle_base_n_alpha)} x "
+                        f"{format_field_value('solid_angle_base_n_theta', config.solid_angle_base_n_theta)}, "
+                        f"refine={format_field_value('solid_angle_refine_levels', config.solid_angle_refine_levels)}, "
+                        f"edge={format_field_value('solid_angle_edge_samples', config.solid_angle_edge_samples)}, "
+                        f"chunk={format_field_value('solid_angle_chunk', config.solid_angle_chunk)}"
                     )
-            append_log(f"Output will be saved to '{config.output_image}'")
-            run_info["stage_label"] = "Preparing"
+                run_info["stage_label"] = "Compute solid angle"
             run_info["stage_percent"] = 0.0
             run_info["overall_percent"] = 0.0
             usage = ProcessUsageSampler()
@@ -873,13 +1247,16 @@ def run_form(stdscr: Any, base_config: AppConfig) -> None:
                     last_draw_progress = overall_percent
 
             try:
-                run_lensing(
-                    config,
-                    log=append_log,
-                    show_progress=False,
-                    metric_debug=False,
-                    progress=update_progress,
-                )
+                if config.operation_mode == "lensing":
+                    run_lensing(
+                        config,
+                        log=append_log,
+                        show_progress=False,
+                        metric_debug=False,
+                        progress=update_progress,
+                    )
+                else:
+                    run_shadow_solid_angle(config, log=append_log, progress=update_progress)
             except Exception as exc:  # pragma: no cover - user-facing error path
                 append_log(f"Error: {exc}")
                 status = f"Run failed: {exc}"
@@ -890,7 +1267,10 @@ def run_form(stdscr: Any, base_config: AppConfig) -> None:
             cpu_percent, ram_mb = usage.sample()
             run_info["cpu_percent"] = cpu_percent
             run_info["ram_mb"] = ram_mb
-            status = "Generation complete. You can edit and run again."
+            if config.operation_mode == "lensing":
+                status = "Generation complete. You can edit and run again."
+            else:
+                status = "Solid-angle computation complete."
 
 
 def benchmark_summary_lines(
@@ -904,12 +1284,16 @@ def benchmark_summary_lines(
     pixel_count = width * height
     render_time = max(timings.get("render", 0.0), 1e-12)
     total_time = max(timings.get("total", 0.0), 1e-12)
+    resolution = format_resolution_value(width, height)
+    pixel_count_text = append_unit(f"{pixel_count:,}", "px")
+    total_rays_text = append_unit(f"{total_rays:,}", "rays")
+    traced_rays_text = append_unit(f"{traced_rays:,}", "rays")
     return [
         "Benchmark summary",
-        f"  resolution: {width}x{height} ({pixel_count:,} pixels)",
+        f"  resolution: {resolution} ({pixel_count_text})",
         f"  alpha_crit: {alpha_crit:.6f} rad",
-        f"  total rays: {total_rays:,}",
-        f"  traced rays: {traced_rays:,}",
+        f"  total rays: {total_rays_text}",
+        f"  traced rays: {traced_rays_text}",
         f"  {'prepare_source':<26}{timings.get('prepare_source', 0.0):>10.3f} s",
         f"  {'build_lookup':<26}{timings.get('build_lookup', 0.0):>10.3f} s",
         f"  {'precompute':<26}{timings.get('precompute', 0.0):>10.3f} s",
@@ -918,6 +1302,70 @@ def benchmark_summary_lines(
         f"  {'total':<26}{timings.get('total', 0.0):>10.3f} s",
         f"  {'render_throughput':<26}{(pixel_count / render_time) / 1e6:>10.2f} MPix/s",
         f"  {'overall_throughput':<26}{(pixel_count / total_time) / 1e6:>10.2f} MPix/s",
+    ]
+
+
+def shadow_benchmark_summary_lines(
+    config: AppConfig,
+    stats: dict[str, float | int],
+) -> list[str]:
+    total_time = max(float(stats.get("total_time", 0.0)), 1e-12)
+    if config.shadow_metric == "schwarzschild":
+        analytic_time = float(stats.get("analytic_time", total_time))
+        return [
+            "Shadow solid-angle benchmark",
+            "  metric: Schwarzschild",
+            f"  {'analytic':<26}{analytic_time:>10.6f} s",
+            f"  {'total':<26}{total_time:>10.6f} s",
+        ]
+
+    trace_time = max(
+        float(stats.get("stencil_trace_time", 0.0))
+        + float(stats.get("terminal_trace_time", 0.0)),
+        1e-12,
+    )
+    total_rays = int(stats.get("total_rays", 0))
+    base_cells_text = append_unit(f"{int(stats.get('base_cells', 0)):,}", "cells")
+    levels_text = (
+        f"{append_unit(int(stats.get('levels_processed', 0)), 'levels')} / "
+        f"{append_unit(int(stats.get('levels_requested', 0)), 'levels requested')}"
+    )
+    evaluated_cells_text = append_unit(f"{int(stats.get('cells_evaluated', 0)):,}", "cells")
+    refined_cells_text = append_unit(f"{int(stats.get('refined_cells', 0)):,}", "cells")
+    terminal_mixed_text = append_unit(f"{int(stats.get('terminal_mixed_cells', 0)):,}", "cells")
+    captured_cells_text = append_unit(f"{int(stats.get('captured_full_cells', 0)):,}", "cells")
+    escaped_cells_text = append_unit(f"{int(stats.get('escaped_full_cells', 0)):,}", "cells")
+    mixed_cells_text = append_unit(f"{int(stats.get('mixed_cells', 0)):,}", "cells")
+    stencil_rays_text = append_unit(f"{int(stats.get('stencil_rays', 0)):,}", "rays")
+    terminal_rays_text = append_unit(f"{int(stats.get('terminal_rays', 0)):,}", "rays")
+    retry_rays_text = append_unit(f"{int(stats.get('retry_rays', 0)):,}", "rays")
+    total_rays_text = append_unit(f"{total_rays:,}", "rays")
+    return [
+        "Shadow solid-angle benchmark",
+        f"  metric: Kerr ({format_choice_value('solid_angle_profile', config.solid_angle_profile)})",
+        f"  base cells: {base_cells_text}",
+        f"  levels: {levels_text}",
+        f"  evaluated cells: {evaluated_cells_text}",
+        f"  refined cells: {refined_cells_text}",
+        f"  terminal mixed cells: {terminal_mixed_text}",
+        f"  full captured cells: {captured_cells_text}",
+        f"  full escaped cells: {escaped_cells_text}",
+        f"  mixed cells seen: {mixed_cells_text}",
+        f"  stencil rays: {stencil_rays_text}",
+        f"  terminal rays: {terminal_rays_text}",
+        f"  retry rays: {retry_rays_text}",
+        f"  total rays: {total_rays_text}",
+        f"  {'setup':<26}{float(stats.get('setup_time', 0.0)):>10.3f} s",
+        f"  {'trace_stencil':<26}{float(stats.get('stencil_trace_time', 0.0)):>10.3f} s",
+        f"  {'classify':<26}{float(stats.get('classification_time', 0.0)):>10.3f} s",
+        f"  {'full_area':<26}{float(stats.get('full_area_time', 0.0)):>10.3f} s",
+        f"  {'subdivide':<26}{float(stats.get('subdivide_time', 0.0)):>10.3f} s",
+        f"  {'terminal_setup':<26}{float(stats.get('terminal_setup_time', 0.0)):>10.3f} s",
+        f"  {'trace_terminal':<26}{float(stats.get('terminal_trace_time', 0.0)):>10.3f} s",
+        f"  {'terminal_area':<26}{float(stats.get('terminal_area_time', 0.0)):>10.3f} s",
+        f"  {'total':<26}{total_time:>10.3f} s",
+        f"  {'trace_throughput':<26}{(total_rays / trace_time) / 1e6:>10.2f} Mray/s",
+        f"  {'overall_throughput':<26}{(total_rays / total_time) / 1e6:>10.2f} Mray/s",
     ]
 
 
@@ -941,6 +1389,108 @@ def metric_spin_over_mass(metric: Any) -> float:
     if np.isclose(metric_mass, 0.0):
         return 0.0
     return float(getattr(metric, "a", 0.0)) / metric_mass
+
+
+def run_shadow_solid_angle(
+    config: AppConfig,
+    log: Callable[[str], None] | None = None,
+    progress: Callable[[str, float, float], None] | None = None,
+    show_progress: bool | None = None,
+) -> None:
+    def emit(message: str) -> None:
+        if log is None:
+            print(message)
+        else:
+            log(message)
+
+    if show_progress is None:
+        show_progress = config.debug and progress is None and log is None
+
+    last_progress_time = perf_counter()
+    last_progress_overall = -1.0
+
+    def emit_progress(stage_label: str, stage_fraction: float, overall_fraction: float) -> None:
+        nonlocal last_progress_time, last_progress_overall
+        stage_percent = max(0.0, min(100.0, 100.0 * stage_fraction))
+        overall_percent = max(0.0, min(100.0, 100.0 * overall_fraction))
+        if progress is not None:
+            progress(stage_label, stage_percent, overall_percent)
+            return
+        if not show_progress:
+            return
+        now = perf_counter()
+        if (
+            overall_fraction < 1.0
+            and abs(overall_fraction - last_progress_overall) < 0.02
+            and (now - last_progress_time) < 0.25
+        ):
+            return
+        print(
+            f"[solid-angle] {stage_label:<24} "
+            f"{overall_percent:6.2f}% total | {stage_percent:6.2f}% stage"
+        )
+        last_progress_time = now
+        last_progress_overall = overall_fraction
+
+    r_obs = config.r_obs * config.M
+    theta_obs = np.radians(config.theta_obs_deg)
+    metric_a = spin_mass_units_to_kerr_a(config.M, config.a)
+    stats: dict[str, float | int]
+
+    if config.shadow_metric == "schwarzschild":
+        analytic_start = perf_counter()
+        emit_progress("Analytic solution", 0.0, 0.0)
+        omega, alpha = schwarzschild_shadow_solid_angle(r_obs, M=config.M)
+        fraction = omega / (4.0 * np.pi)
+        stats = {
+            "analytic_time": perf_counter() - analytic_start,
+            "total_time": perf_counter() - analytic_start,
+        }
+        emit_progress("Analytic solution", 1.0, 1.0)
+        emit("Schwarzschild black-hole shadow")
+        emit(f"M                     = {append_unit(config.M, 'M')}")
+        emit(f"r_obs                 = {append_unit(r_obs, 'M')}")
+        emit(f"shadow angular radius = {np.degrees(alpha):.6f} deg")
+        emit(f"shadow solid angle    = {omega:.10f} sr")
+        emit(f"fraction of full sky  = {fraction:.10%}")
+    else:
+        omega, fraction, stats = kerr_shadow_solid_angle(
+            r_obs,
+            metric_a,
+            M=config.M,
+            theta_obs=theta_obs,
+            base_n_alpha=config.solid_angle_base_n_alpha,
+            base_n_theta=config.solid_angle_base_n_theta,
+            refine_levels=config.solid_angle_refine_levels,
+            edge_samples=config.solid_angle_edge_samples,
+            chunk=config.solid_angle_chunk,
+            progress_callback=emit_progress,
+            return_stats=True,
+        )
+        emit("Kerr black-hole shadow")
+        emit(f"M                     = {append_unit(config.M, 'M')}")
+        emit(f"spin                  = {append_unit(config.a, 'a/M')}")
+        emit(f"a                     = {append_unit(metric_a, 'M')}")
+        emit(f"r_obs                 = {append_unit(r_obs, 'M')}")
+        emit(f"theta_obs             = {config.theta_obs_deg:.6f} deg")
+        emit(
+            "integration profile   = "
+            f"{format_choice_value('solid_angle_profile', config.solid_angle_profile)}"
+        )
+        emit(f"shadow solid angle    = {omega:.10f} sr")
+        emit(f"fraction of full sky  = {fraction:.10%}")
+        emit(
+            "integration settings  = "
+            f"{format_field_value('solid_angle_base_n_alpha', config.solid_angle_base_n_alpha)} x "
+            f"{format_field_value('solid_angle_base_n_theta', config.solid_angle_base_n_theta)}, "
+            f"refine={format_field_value('solid_angle_refine_levels', config.solid_angle_refine_levels)}, "
+            f"edge={format_field_value('solid_angle_edge_samples', config.solid_angle_edge_samples)}, "
+            f"chunk={format_field_value('solid_angle_chunk', config.solid_angle_chunk)}"
+        )
+
+    if config.benchmark:
+        for line in shadow_benchmark_summary_lines(config, stats):
+            emit(line)
 
 
 def run_lensing(
@@ -984,10 +1534,12 @@ def run_lensing(
             timings[key] = perf_counter() - start_time
 
     if config.debug:
+        metric_mass = append_unit(f"{metric.M:g}", "M")
+        metric_spin = append_unit(f"{metric_spin_over_mass(metric):g}", "a/M")
+        metric_a = append_unit(f"{getattr(metric, 'a', 0.0):g}", "M")
         emit(
             f"Metric: {type(metric).__name__} "
-            f"(M={metric.M}, a/M={metric_spin_over_mass(metric):g}, "
-            f"a={getattr(metric, 'a', 0.0):g})"
+            f"(M={metric_mass}, spin={metric_spin}, a={metric_a})"
         )
 
     emit_progress("prepare_source", 0.0)
@@ -1006,12 +1558,13 @@ def run_lensing(
 
     if config.debug:
         if config.source_mode == "image":
-            emit(f"Image: {width}x{height}")
+            emit(f"Image: {format_resolution_value(width, height)}")
         else:
-            emit(f"Stripes output: {width}x{height}")
+            emit(f"Stripes output: {format_resolution_value(width, height)}")
 
     r_obs = config.r_obs * metric.M
-    alpha_crit = metric.alpha_crit(r_obs)
+    theta_obs = np.radians(config.theta_obs_deg)
+    alpha_crit = metric.alpha_crit(r_obs, theta_obs)
 
     vertical_fov = np.radians(config.fov_v)
     horizontal_fov = 2.0 * np.arctan(np.tan(vertical_fov / 2.0) * width / height)
@@ -1029,6 +1582,7 @@ def run_lensing(
         bh_status = "behind observer" if not bh_in_front else ("inside FOV" if bh_in_fov else "outside FOV")
 
         emit(f"r_obs = {r_obs:.1f} M, alpha_crit = {np.degrees(alpha_crit):.4f} deg")
+        emit(f"theta_obs = {config.theta_obs_deg:.4f} deg")
         emit(
             "BH screen offset: "
             f"psi_y={np.degrees(psi_y):.4f} deg, "
@@ -1036,7 +1590,10 @@ def run_lensing(
             f"({bh_status})"
         )
         if config.source_mode == "stripes":
-            emit(f"Stripe counts: n_x={config.n_x}, n_y={config.n_y}")
+            emit(
+                f"Stripe counts: n_x={append_unit(config.n_x, 'stripes')}, "
+                f"n_y={append_unit(config.n_y, 'stripes')}"
+            )
             if config.color_visualization:
                 emit(
                     "Color visualization enabled; rendering stripe hits in "
@@ -1114,6 +1671,7 @@ def run_lensing(
                 alpha_crit,
                 r_obs,
                 metric,
+                theta_obs=theta_obs,
                 psi=psi,
                 return_direction_lookup=config.color_visualization,
                 show_progress=show_progress,
@@ -1130,6 +1688,7 @@ def run_lensing(
                 alpha_crit,
                 r_obs,
                 metric,
+                theta_obs=theta_obs,
                 psi=psi,
                 show_progress=show_progress,
                 debug=metric_debug,
@@ -1143,7 +1702,10 @@ def run_lensing(
         emit_progress("precompute", 1.0)
 
     if config.debug:
-        emit(f"Traced rays: {traced_rays:,}/{total_rays:,}")
+        emit(
+            f"Traced rays: {append_unit(f'{traced_rays:,}', 'rays')} / "
+            f"{append_unit(f'{total_rays:,}', 'rays')}"
+        )
 
     emit_progress("render", 0.0)
     stage_start = bench_start()
@@ -1192,7 +1754,7 @@ def run_lensing(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Interactive wrapper around image_lens.py with stripes mode"
+        description="Interactive wrapper around lens rendering and shadow solid-angle tools"
     )
     parser.add_argument(
         "--no-ui",
@@ -1200,10 +1762,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run directly from CLI arguments without the interactive form",
     )
     parser.add_argument(
+        "--mode",
+        choices=("lensing", "shadow-solid-angle"),
+        default="lensing",
+        help="Top-level mode: render a lensing image or compute shadow solid angle",
+    )
+    parser.add_argument(
         "--source-mode",
         choices=("image", "stripes"),
         default="image",
         help="Background source mode",
+    )
+    parser.add_argument(
+        "--shadow-metric",
+        choices=("kerr", "schwarzschild"),
+        default="kerr",
+        help="Metric used in shadow solid-angle mode",
+    )
+    parser.add_argument(
+        "--solid-angle-profile",
+        choices=("quick", "normal", "accurate", "ultra-accurate"),
+        default="normal",
+        help="Preset for Kerr shadow solid-angle integration; explicit solid-angle knobs override it",
     )
     parser.add_argument("--input-image", default="image.jpg", help="Background image path")
     parser.add_argument("--output-image", default="lensed_image.png", help="Output image path")
@@ -1230,11 +1810,52 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--M", type=float, default=1.0, help="BH mass")
     parser.add_argument("--a", type=float, default=0.0, help="Dimensionless BH spin a/M (-1 <= a/M <= 1)")
     parser.add_argument("--r-obs", type=float, default=100.0, help="Observer distance in units of M")
+    parser.add_argument(
+        "--theta-obs-deg",
+        type=float,
+        default=90.0,
+        help="Observer inclination from the spin axis in deg",
+    )
     parser.add_argument("--psi-y", type=float, default=0.0, help="BH vertical offset in deg")
     parser.add_argument("--psi-x", type=float, default=0.0, help="BH horizontal offset in deg")
     parser.add_argument("--fov-v", type=float, default=40.0, help="Vertical field of view in deg")
     parser.add_argument("--debug", action="store_true", help="Enable debug logs and progress bars")
     parser.add_argument("--benchmark", action="store_true", help="Enable benchmark timing summary")
+    parser.add_argument(
+        "--solid-angle-only",
+        action="store_true",
+        help="Compatibility alias for --mode shadow-solid-angle",
+    )
+    parser.add_argument(
+        "--solid-angle-base-n-alpha",
+        type=int,
+        default=None,
+        help="Base alpha grid for Kerr shadow solid-angle integration",
+    )
+    parser.add_argument(
+        "--solid-angle-base-n-theta",
+        type=int,
+        default=None,
+        help="Base theta grid for Kerr shadow solid-angle integration",
+    )
+    parser.add_argument(
+        "--solid-angle-refine-levels",
+        type=int,
+        default=None,
+        help="Adaptive refinement depth for Kerr shadow solid-angle integration",
+    )
+    parser.add_argument(
+        "--solid-angle-edge-samples",
+        type=int,
+        default=None,
+        help="Terminal edge subgrid size for Kerr shadow solid-angle integration",
+    )
+    parser.add_argument(
+        "--solid-angle-chunk",
+        type=int,
+        default=None,
+        help="Batch size for Kerr shadow solid-angle ray tracing",
+    )
     parser.add_argument(
         "--wrap-outside-background-plane",
         action="store_true",
@@ -1250,9 +1871,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    solid_angle_profile = args.solid_angle_profile.replace("-", "_")
+    solid_angle_preset = solid_angle_profile_preset(solid_angle_profile)
 
     seed_config = AppConfig(
+        operation_mode=(
+            "shadow_solid_angle" if (args.solid_angle_only or args.mode == "shadow-solid-angle")
+            else "lensing"
+        ),
         source_mode=args.source_mode,
+        shadow_metric=args.shadow_metric,
+        solid_angle_profile=solid_angle_profile,
         input_image=args.input_image,
         output_image=args.output_image,
         width=args.width,
@@ -1263,23 +1892,71 @@ def main() -> int:
         M=args.M,
         a=args.a,
         r_obs=args.r_obs,
+        theta_obs_deg=args.theta_obs_deg,
         psi_y=args.psi_y,
         psi_x=args.psi_x,
         fov_v=args.fov_v,
+        solid_angle_base_n_alpha=(
+            args.solid_angle_base_n_alpha
+            if args.solid_angle_base_n_alpha is not None
+            else solid_angle_preset["solid_angle_base_n_alpha"]
+        ),
+        solid_angle_base_n_theta=(
+            args.solid_angle_base_n_theta
+            if args.solid_angle_base_n_theta is not None
+            else solid_angle_preset["solid_angle_base_n_theta"]
+        ),
+        solid_angle_refine_levels=(
+            args.solid_angle_refine_levels
+            if args.solid_angle_refine_levels is not None
+            else solid_angle_preset["solid_angle_refine_levels"]
+        ),
+        solid_angle_edge_samples=(
+            args.solid_angle_edge_samples
+            if args.solid_angle_edge_samples is not None
+            else solid_angle_preset["solid_angle_edge_samples"]
+        ),
+        solid_angle_chunk=(
+            args.solid_angle_chunk
+            if args.solid_angle_chunk is not None
+            else solid_angle_preset["solid_angle_chunk"]
+        ),
         debug=args.debug,
         benchmark=args.benchmark,
         wrap_outside_background_plane=args.wrap_outside_background_plane,
     )
 
-    if args.no_ui:
+    if seed_config.operation_mode == "shadow_solid_angle" and args.no_ui:
         state = config_to_state(seed_config)
-        config, err = parse_state(state)
+        config, err = parse_state(state, require_source_assets=False)
         if err:
             print(f"Validation error: {err}")
             return 2
         assert config is not None
         try:
-            run_lensing(config)
+            run_shadow_solid_angle(config)
+        except Exception as exc:  # pragma: no cover - user-facing error path
+            print(f"Error: {exc}")
+            if config.debug:
+                raise
+            return 1
+        return 0
+
+    if args.no_ui:
+        state = config_to_state(seed_config)
+        config, err = parse_state(
+            state,
+            require_source_assets=(seed_config.operation_mode == "lensing"),
+        )
+        if err:
+            print(f"Validation error: {err}")
+            return 2
+        assert config is not None
+        try:
+            if config.operation_mode == "lensing":
+                run_lensing(config)
+            else:
+                run_shadow_solid_angle(config)
         except Exception as exc:  # pragma: no cover - user-facing error path
             print(f"Error: {exc}")
             if config.debug:
