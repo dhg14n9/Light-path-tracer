@@ -1,5 +1,5 @@
-# Every set of coordinate is written as (y, x)
-# FOV pairs: (horizontal, vertical)
+# Coordinates are ordered as (y, x).
+# FOV pairs are (horizontal, vertical).
 
 import numpy as np
 import matplotlib.image as mpimg
@@ -32,8 +32,7 @@ def _psi_to_bh_direction(psi):
     sin_yaw = np.sin(psi_x)
     cos_yaw = np.cos(psi_x)
 
-    # Camera axes: +x right, +y down, +z forward.
-    # psi_y > 0 means BH moves upward, hence negative y component.
+    # Camera frame: +x right, +y down, +z forward; psi_y > 0 moves the BH up.
     return np.array([
         sin_yaw * cos_pitch,
         -sin_pitch,
@@ -49,7 +48,7 @@ def _psi_frame(psi):
     cam_x = np.array([1.0, 0.0, 0.0], dtype=np.float64)
     cam_y = np.array([0.0, 1.0, 0.0], dtype=np.float64)
 
-    # Tangent basis around the BH direction. e_x/e_y align with image axes at psi=0.
+    # Tangent basis around the BH direction; matches image axes at psi=0.
     e_x = cam_x - np.dot(cam_x, d) * d
     e_x_norm = np.linalg.norm(e_x)
     if e_x_norm < 1e-12:
@@ -239,7 +238,8 @@ def _kerr_trace_direction_to_camera(direction_x, direction_y, direction_z,
                                     d, e_x, e_y):
     """Convert Kerr trace directions into the camera-coordinate frame."""
     canonical_x = direction_y
-    canonical_y = -direction_z
+    # Kerr's a=0 limit uses +z for screen-up; the renderer uses +y down.
+    canonical_y = direction_z
     canonical_z = -direction_x
     return _canonical_trace_direction_to_camera(
         canonical_x, canonical_y, canonical_z, d, e_x, e_y,
@@ -678,7 +678,6 @@ def main(metric=None, M=1.0, a=0.0, r_obs_mult=100.0,
     total_start = _bench_start(benchmark)
     _debug_log(debug, f"Output: {width}x{height}")
 
-    # Observer properties
     r_obs = r_obs_mult * metric.M
     alpha_crit = metric.alpha_crit(r_obs)
     _debug_log(
@@ -741,7 +740,6 @@ def main(metric=None, M=1.0, a=0.0, r_obs_mult=100.0,
             show_progress=debug, debug=debug)
         _bench_stop(benchmark, timings, "precompute", stage_start)
 
-    # Render
     stage_start = _bench_start(benchmark)
     lensed_image = render_lensed_image(
         final_alpha_lookup, fov, n_x, n_y,
@@ -751,7 +749,6 @@ def main(metric=None, M=1.0, a=0.0, r_obs_mult=100.0,
     )
     _bench_stop(benchmark, timings, "render", stage_start)
 
-    # Save
     stage_start = _bench_start(benchmark)
     mpimg.imsave('lensed_image.png', lensed_image)
     _bench_stop(benchmark, timings, "save_image", stage_start)
