@@ -21,6 +21,13 @@ from typing import Any, Callable
 import matplotlib.image as mpimg
 import numpy as np
 
+from asymmetries import (
+    ASYMMETRY_CIRCLE_FIT_CHOICES,
+    ASYMMETRY_PERFORMANCE_PROFILE_NAMES,
+    AsymmetryMeasurements,
+    asymmetry_performance_profile_preset,
+    filter_asymmetry_measurement_kwargs,
+)
 from image_lens import (
     _psi_to_cam_projection,
     build_alpha_lookup,
@@ -46,6 +53,11 @@ class AppConfig:
     source_mode: str = "image"
     shadow_metric: str = "kerr"
     solid_angle_profile: str = "normal"
+    solid_angle_advanced_tuning: bool = False
+    asymmetry_measurement: str = "all"
+    asymmetry_profile: str = "normal"
+    asymmetry_advanced_tuning: bool = False
+    asymmetry_circle_fit: str = "global"
     input_image: str = "image.jpg"
     output_image: str = "lensed_image.png"
     width: int = DEFAULT_STRIPES_IMAGE_DIMENSION[1]
@@ -65,6 +77,13 @@ class AppConfig:
     solid_angle_refine_levels: int = 4
     solid_angle_edge_samples: int = 4
     solid_angle_chunk: int = 50_000
+    asymmetry_n_bracket_samples: int = 65
+    asymmetry_tol: float = 1e-8
+    asymmetry_max_iter: int = 64
+    asymmetry_n_theta_samples: int = 181
+    asymmetry_n_refine_samples: int = 17
+    asymmetry_refine_levels: int = 4
+    asymmetry_n_boundary_samples: int = 361
     debug: bool = False
     benchmark: bool = False
     wrap_outside_background_plane: bool = False
@@ -75,7 +94,7 @@ FIELD_SPECS: list[dict[str, str]] = [
         "key": "operation_mode",
         "label": "Mode",
         "kind": "choice",
-        "description": "Choose whether to render a lensed image or compute the black-hole shadow solid angle directly.",
+        "description": "Choose whether to render a lensed image, compute the black-hole shadow solid angle directly, or print registered asymmetry measurements for the current observer setup.",
     },
     {
         "key": "source_mode",
@@ -94,6 +113,36 @@ FIELD_SPECS: list[dict[str, str]] = [
         "label": "SA Profile",
         "kind": "choice",
         "description": "Kerr shadow mode only. Load a preset for the adaptive Kerr solid-angle integrator. Quick is fastest and roughest, Normal is the default balance, Accurate spends more work on the shadow boundary, and Ultra Accurate pushes the integration settings further. You can still edit the individual solid-angle settings afterward.",
+    },
+    {
+        "key": "solid_angle_advanced_tuning",
+        "label": "SA Advanced",
+        "kind": "bool",
+        "description": "Shadow mode / Kerr only. Turn this on to reveal the individual solid-angle integration knobs. When off, the selected solid-angle profile alone controls those numeric settings.",
+    },
+    {
+        "key": "asymmetry_measurement",
+        "label": "Asymmetry Measure",
+        "kind": "choice",
+        "description": "Asymmetry mode only. Choose which registered asymmetry measurement to compute. 'All' prints every currently registered asymmetry measurement for the selected metric and observer.",
+    },
+    {
+        "key": "asymmetry_profile",
+        "label": "Asymmetry Profile",
+        "kind": "choice",
+        "description": "Asymmetry mode only. Load a preset for the asymmetry ray-sampling settings. Quick is fastest and roughest, Normal matches the current defaults, Accurate increases the search density, and Ultra Accurate pushes the sampling and tolerances further. You can still edit the individual asymmetry settings afterward.",
+    },
+    {
+        "key": "asymmetry_advanced_tuning",
+        "label": "Advanced Tuning",
+        "kind": "bool",
+        "description": "Asymmetry mode only. Turn this on to reveal the individual asymmetry performance knobs. When off, the selected asymmetry profile alone controls those numeric settings.",
+    },
+    {
+        "key": "asymmetry_circle_fit",
+        "label": "Circle Algorithm",
+        "kind": "choice",
+        "description": "Asymmetry mode only. Choose how the circularity measurement fits its reference circle. Global Least Squares uses many boundary samples, while Cardinal Points fits only the top, bottom, left, and right extrema.",
     },
     {
         "key": "input_image",
@@ -210,6 +259,48 @@ FIELD_SPECS: list[dict[str, str]] = [
         "description": "Kerr shadow mode only. Number of sample rays to trace per batch during solid-angle integration.",
     },
     {
+        "key": "asymmetry_n_bracket_samples",
+        "label": "Asym Bracket Samples",
+        "kind": "int",
+        "description": "Asymmetry mode only. Number of coarse alpha samples used to bracket the shadow edge at one screen azimuth before bisection refinement begins.",
+    },
+    {
+        "key": "asymmetry_tol",
+        "label": "Asym Alpha Tol",
+        "kind": "float",
+        "description": "Asymmetry mode only. Bisection stopping tolerance for alpha_crit(theta). Smaller values improve edge precision but increase tracing work.",
+    },
+    {
+        "key": "asymmetry_max_iter",
+        "label": "Asym Max Iter",
+        "kind": "int",
+        "description": "Asymmetry mode only. Maximum number of bisection iterations allowed while refining alpha_crit(theta).",
+    },
+    {
+        "key": "asymmetry_n_theta_samples",
+        "label": "Asym Theta Samples",
+        "kind": "int",
+        "description": "Asymmetry mode only. Number of coarse screen-azimuth samples used to locate left, right, top, and bottom shadow extrema.",
+    },
+    {
+        "key": "asymmetry_n_refine_samples",
+        "label": "Asym Refine Samples",
+        "kind": "int",
+        "description": "Asymmetry mode only. Number of samples per local refinement pass while honing in on a shadow extremum.",
+    },
+    {
+        "key": "asymmetry_refine_levels",
+        "label": "Asym Refine Levels",
+        "kind": "int",
+        "description": "Asymmetry mode only. Number of refinement rounds applied after the coarse extremum search.",
+    },
+    {
+        "key": "asymmetry_n_boundary_samples",
+        "label": "Asym Boundary Samples",
+        "kind": "int",
+        "description": "Asymmetry mode only. Number of full-boundary samples used by the circularity measurement and global circle fit.",
+    },
+    {
         "key": "debug",
         "label": "Debug",
         "kind": "bool",
@@ -233,7 +324,7 @@ ACTION_SPECS: list[dict[str, str]] = [
     {
         "key": "run",
         "label": "Run",
-        "description": "Validate the current settings and run the selected mode. Lensing mode renders an image, while shadow solid angle mode computes and prints the shadow area on the observer sky.",
+        "description": "Validate the current settings and run the selected mode. Lensing mode renders an image, shadow solid angle mode computes the shadow area on the observer sky, and asymmetry mode prints the selected asymmetry measurements.",
     },
     {
         "key": "reset",
@@ -258,6 +349,7 @@ STAGE_LABELS = {key: label for key, label, _ in STAGE_SPECS}
 OPERATION_MODE_LABELS = {
     "lensing": "Lensing",
     "shadow_solid_angle": "Shadow Solid Angle",
+    "asymmetry_measurements": "Asymmetry Measurements",
 }
 SOURCE_MODE_LABELS = {
     "image": "Image",
@@ -273,11 +365,28 @@ SOLID_ANGLE_PROFILE_LABELS = {
     "accurate": "Accurate",
     "ultra_accurate": "Ultra Accurate",
 }
+ASYMMETRY_PROFILE_LABELS = {
+    "quick": "Quick",
+    "normal": "Normal",
+    "accurate": "Accurate",
+    "ultra_accurate": "Ultra Accurate",
+}
+ASYMMETRY_CIRCLE_FIT_LABELS = {
+    "global": "Global Least Squares",
+    "cardinal": "Cardinal Points",
+}
+ASYMMETRY_MEASUREMENT_VALUES = ("all",) + AsymmetryMeasurements.measurement_names()
+ASYMMETRY_MEASUREMENT_LABELS = {
+    "all": "All",
+}
 CHOICE_VALUES: dict[str, tuple[str, ...]] = {
-    "operation_mode": ("lensing", "shadow_solid_angle"),
+    "operation_mode": ("lensing", "shadow_solid_angle", "asymmetry_measurements"),
     "source_mode": ("image", "stripes"),
     "shadow_metric": ("kerr", "schwarzschild"),
     "solid_angle_profile": ("quick", "normal", "accurate", "ultra_accurate"),
+    "asymmetry_measurement": ASYMMETRY_MEASUREMENT_VALUES,
+    "asymmetry_profile": ASYMMETRY_PERFORMANCE_PROFILE_NAMES,
+    "asymmetry_circle_fit": ASYMMETRY_CIRCLE_FIT_CHOICES,
 }
 KERR_SOLID_ANGLE_PROFILE_PRESETS: dict[str, dict[str, int]] = {
     "quick": {
@@ -326,14 +435,45 @@ LENSING_ONLY_FIELDS = {
 SHADOW_ONLY_FIELDS = {
     "shadow_metric",
     "solid_angle_profile",
+    "solid_angle_advanced_tuning",
     "solid_angle_base_n_alpha",
     "solid_angle_base_n_theta",
     "solid_angle_refine_levels",
     "solid_angle_edge_samples",
     "solid_angle_chunk",
 }
+SHADOW_ADVANCED_TUNING_FIELDS = {
+    "solid_angle_base_n_alpha",
+    "solid_angle_base_n_theta",
+    "solid_angle_refine_levels",
+    "solid_angle_edge_samples",
+    "solid_angle_chunk",
+}
+ASYMMETRY_ONLY_FIELDS = {
+    "asymmetry_measurement",
+    "asymmetry_profile",
+    "asymmetry_advanced_tuning",
+    "asymmetry_circle_fit",
+    "asymmetry_n_bracket_samples",
+    "asymmetry_tol",
+    "asymmetry_max_iter",
+    "asymmetry_n_theta_samples",
+    "asymmetry_n_refine_samples",
+    "asymmetry_refine_levels",
+    "asymmetry_n_boundary_samples",
+}
+ASYMMETRY_ADVANCED_TUNING_FIELDS = {
+    "asymmetry_n_bracket_samples",
+    "asymmetry_tol",
+    "asymmetry_max_iter",
+    "asymmetry_n_theta_samples",
+    "asymmetry_n_refine_samples",
+    "asymmetry_refine_levels",
+    "asymmetry_n_boundary_samples",
+}
 SHADOW_KERR_ONLY_FIELDS = {
     "solid_angle_profile",
+    "solid_angle_advanced_tuning",
     "a",
     "theta_obs_deg",
     "solid_angle_base_n_alpha",
@@ -378,6 +518,11 @@ def apply_solid_angle_profile_to_state(state: dict[str, Any], profile: str) -> N
         state[key] = f"{value:d}"
 
 
+def apply_asymmetry_profile_to_state(state: dict[str, Any], profile: str) -> None:
+    for key, value in asymmetry_performance_profile_preset(profile).items():
+        state[f"asymmetry_{key}"] = f"{value:g}" if isinstance(value, float) else f"{value:d}"
+
+
 def apply_choice_change(state: dict[str, Any], key: str, label: str | None = None) -> str:
     next_value = toggle_choice(key, str(state[key]))
     state[key] = next_value
@@ -388,7 +533,26 @@ def apply_choice_change(state: dict[str, Any], key: str, label: str | None = Non
             f"{name} set to {format_choice_value(key, next_value)} "
             "and Kerr solid-angle settings updated."
         )
+    if key == "asymmetry_profile":
+        apply_asymmetry_profile_to_state(state, next_value)
+        return (
+            f"{name} set to {format_choice_value(key, next_value)} "
+            "and asymmetry settings updated."
+        )
     return f"{name} set to {format_choice_value(key, next_value)}"
+
+
+def apply_bool_change(state: dict[str, Any], key: str, label: str | None = None) -> str:
+    next_value = not bool(state[key])
+    state[key] = next_value
+    name = label if label is not None else key
+    if key == "solid_angle_advanced_tuning" and not next_value:
+        apply_solid_angle_profile_to_state(state, str(state.get("solid_angle_profile", "normal")))
+        return f"{name} set to Off and solid-angle numeric settings reset to the profile preset"
+    if key == "asymmetry_advanced_tuning" and not next_value:
+        apply_asymmetry_profile_to_state(state, str(state.get("asymmetry_profile", "normal")))
+        return f"{name} set to Off and asymmetry numeric settings reset to the profile preset"
+    return f"{name} set to {next_value}"
 
 
 def choice_label_map(key: str) -> dict[str, str]:
@@ -400,6 +564,12 @@ def choice_label_map(key: str) -> dict[str, str]:
         return SHADOW_METRIC_LABELS
     if key == "solid_angle_profile":
         return SOLID_ANGLE_PROFILE_LABELS
+    if key == "asymmetry_measurement":
+        return ASYMMETRY_MEASUREMENT_LABELS
+    if key == "asymmetry_profile":
+        return ASYMMETRY_PROFILE_LABELS
+    if key == "asymmetry_circle_fit":
+        return ASYMMETRY_CIRCLE_FIT_LABELS
     return {}
 
 
@@ -424,6 +594,13 @@ FIELD_UNIT_SUFFIXES: dict[str, str] = {
     "solid_angle_refine_levels": "levels",
     "solid_angle_edge_samples": "samples/side",
     "solid_angle_chunk": "rays/chunk",
+    "asymmetry_n_bracket_samples": "samples",
+    "asymmetry_tol": "rad",
+    "asymmetry_max_iter": "iters",
+    "asymmetry_n_theta_samples": "theta bins",
+    "asymmetry_n_refine_samples": "samples/level",
+    "asymmetry_refine_levels": "levels",
+    "asymmetry_n_boundary_samples": "samples",
 }
 
 
@@ -440,6 +617,15 @@ def format_field_value(key: str, value: Any) -> str:
     return append_unit(value, FIELD_UNIT_SUFFIXES.get(key))
 
 
+def format_ray_rate(ray_count: int, elapsed_seconds: float) -> str:
+    rate = 0.0 if elapsed_seconds <= 0.0 else float(ray_count) / float(elapsed_seconds)
+    if rate >= 1e6:
+        return f"{rate / 1e6:.2f} Mray/s"
+    if rate >= 1e3:
+        return f"{rate / 1e3:.2f} kray/s"
+    return f"{rate:.2f} ray/s"
+
+
 def format_resolution_value(width: int, height: int) -> str:
     return f"{append_unit(width, 'px')} x {append_unit(height, 'px')}"
 
@@ -448,20 +634,31 @@ def get_visible_field_specs(state: dict[str, Any]) -> list[dict[str, str]]:
     operation_mode = str(state.get("operation_mode", "lensing")).strip().lower()
     source_mode = str(state.get("source_mode", "image")).strip().lower()
     shadow_metric = str(state.get("shadow_metric", "kerr")).strip().lower()
+    solid_angle_advanced_tuning = bool(state.get("solid_angle_advanced_tuning", False))
+    asymmetry_advanced_tuning = bool(state.get("asymmetry_advanced_tuning", False))
     visible: list[dict[str, str]] = []
     for spec in FIELD_SPECS:
         key = spec["key"]
         if operation_mode == "lensing":
-            if key in SHADOW_ONLY_FIELDS:
+            if key in SHADOW_ONLY_FIELDS or key in ASYMMETRY_ONLY_FIELDS:
                 continue
             if source_mode == "image" and key in STRIPES_MODE_ONLY_FIELDS:
                 continue
             if source_mode == "stripes" and key in IMAGE_MODE_ONLY_FIELDS:
                 continue
+        elif operation_mode == "shadow_solid_angle":
+            if key in LENSING_ONLY_FIELDS or key in ASYMMETRY_ONLY_FIELDS:
+                continue
+            if shadow_metric == "schwarzschild" and key in SHADOW_KERR_ONLY_FIELDS:
+                continue
+            if not solid_angle_advanced_tuning and key in SHADOW_ADVANCED_TUNING_FIELDS:
+                continue
         else:
             if key in LENSING_ONLY_FIELDS:
                 continue
-            if shadow_metric == "schwarzschild" and key in SHADOW_KERR_ONLY_FIELDS:
+            if key in SHADOW_ONLY_FIELDS:
+                continue
+            if not asymmetry_advanced_tuning and key in ASYMMETRY_ADVANCED_TUNING_FIELDS:
                 continue
         visible.append(spec)
     return visible
@@ -521,6 +718,11 @@ def config_to_state(config: AppConfig) -> dict[str, Any]:
         "source_mode": config.source_mode,
         "shadow_metric": config.shadow_metric,
         "solid_angle_profile": config.solid_angle_profile,
+        "solid_angle_advanced_tuning": bool(config.solid_angle_advanced_tuning),
+        "asymmetry_measurement": config.asymmetry_measurement,
+        "asymmetry_profile": config.asymmetry_profile,
+        "asymmetry_advanced_tuning": bool(config.asymmetry_advanced_tuning),
+        "asymmetry_circle_fit": config.asymmetry_circle_fit,
         "input_image": config.input_image,
         "output_image": config.output_image,
         "width": f"{config.width:d}",
@@ -540,6 +742,13 @@ def config_to_state(config: AppConfig) -> dict[str, Any]:
         "solid_angle_refine_levels": f"{config.solid_angle_refine_levels:d}",
         "solid_angle_edge_samples": f"{config.solid_angle_edge_samples:d}",
         "solid_angle_chunk": f"{config.solid_angle_chunk:d}",
+        "asymmetry_n_bracket_samples": f"{config.asymmetry_n_bracket_samples:d}",
+        "asymmetry_tol": f"{config.asymmetry_tol:g}",
+        "asymmetry_max_iter": f"{config.asymmetry_max_iter:d}",
+        "asymmetry_n_theta_samples": f"{config.asymmetry_n_theta_samples:d}",
+        "asymmetry_n_refine_samples": f"{config.asymmetry_n_refine_samples:d}",
+        "asymmetry_refine_levels": f"{config.asymmetry_refine_levels:d}",
+        "asymmetry_n_boundary_samples": f"{config.asymmetry_n_boundary_samples:d}",
         "debug": bool(config.debug),
         "benchmark": bool(config.benchmark),
         "wrap_outside_background_plane": bool(config.wrap_outside_background_plane),
@@ -565,8 +774,11 @@ def parse_state(
             return None, f"{name} must be an integer"
 
     operation_mode = str(state["operation_mode"]).strip().lower()
-    if operation_mode not in {"lensing", "shadow_solid_angle"}:
-        return None, "Mode must be either 'lensing' or 'shadow_solid_angle'"
+    if operation_mode not in {"lensing", "shadow_solid_angle", "asymmetry_measurements"}:
+        return None, (
+            "Mode must be one of 'lensing', 'shadow_solid_angle', "
+            "or 'asymmetry_measurements'"
+        )
 
     source_mode = str(state["source_mode"]).strip().lower()
     if source_mode not in {"image", "stripes"}:
@@ -579,6 +791,25 @@ def parse_state(
         return None, (
             "Solid-angle profile must be one of 'quick', 'normal', "
             "'accurate', or 'ultra_accurate'"
+        )
+    solid_angle_advanced_tuning = bool(state["solid_angle_advanced_tuning"])
+    asymmetry_measurement = str(state["asymmetry_measurement"]).strip().lower()
+    if asymmetry_measurement not in ASYMMETRY_MEASUREMENT_VALUES:
+        return None, (
+            "Asymmetry measurement must be 'all' or one of: "
+            + ", ".join(AsymmetryMeasurements.measurement_names())
+        )
+    asymmetry_profile = str(state["asymmetry_profile"]).strip().lower()
+    if asymmetry_profile not in ASYMMETRY_PERFORMANCE_PROFILE_NAMES:
+        return None, (
+            "Asymmetry profile must be one of 'quick', 'normal', "
+            "'accurate', or 'ultra_accurate'"
+        )
+    asymmetry_advanced_tuning = bool(state["asymmetry_advanced_tuning"])
+    asymmetry_circle_fit = str(state["asymmetry_circle_fit"]).strip().lower()
+    if asymmetry_circle_fit not in ASYMMETRY_CIRCLE_FIT_CHOICES:
+        return None, (
+            "Asymmetry circle algorithm must be either 'global' or 'cardinal'"
         )
 
     m, err = parse_float("M", "BH mass")
@@ -614,31 +845,96 @@ def parse_state(
     n_y, err = parse_int("n_y", "Horizontal stripe count")
     if err:
         return None, err
-    solid_angle_base_n_alpha, err = parse_int(
-        "solid_angle_base_n_alpha", "Solid-angle base alpha"
-    )
-    if err:
-        return None, err
-    solid_angle_base_n_theta, err = parse_int(
-        "solid_angle_base_n_theta", "Solid-angle base theta"
-    )
-    if err:
-        return None, err
-    solid_angle_refine_levels, err = parse_int(
-        "solid_angle_refine_levels", "Solid-angle refine levels"
-    )
-    if err:
-        return None, err
-    solid_angle_edge_samples, err = parse_int(
-        "solid_angle_edge_samples", "Solid-angle edge samples"
-    )
-    if err:
-        return None, err
-    solid_angle_chunk, err = parse_int(
-        "solid_angle_chunk", "Solid-angle chunk size"
-    )
-    if err:
-        return None, err
+    solid_angle_base_n_alpha: int | None = None
+    solid_angle_base_n_theta: int | None = None
+    solid_angle_refine_levels: int | None = None
+    solid_angle_edge_samples: int | None = None
+    solid_angle_chunk: int | None = None
+    if operation_mode == "shadow_solid_angle" and shadow_metric == "kerr" and solid_angle_advanced_tuning:
+        solid_angle_base_n_alpha, err = parse_int(
+            "solid_angle_base_n_alpha", "Solid-angle base alpha"
+        )
+        if err:
+            return None, err
+        solid_angle_base_n_theta, err = parse_int(
+            "solid_angle_base_n_theta", "Solid-angle base theta"
+        )
+        if err:
+            return None, err
+        solid_angle_refine_levels, err = parse_int(
+            "solid_angle_refine_levels", "Solid-angle refine levels"
+        )
+        if err:
+            return None, err
+        solid_angle_edge_samples, err = parse_int(
+            "solid_angle_edge_samples", "Solid-angle edge samples"
+        )
+        if err:
+            return None, err
+        solid_angle_chunk, err = parse_int(
+            "solid_angle_chunk", "Solid-angle chunk size"
+        )
+        if err:
+            return None, err
+    else:
+        solid_angle_preset = solid_angle_profile_preset(solid_angle_profile)
+        solid_angle_base_n_alpha = int(solid_angle_preset["solid_angle_base_n_alpha"])
+        solid_angle_base_n_theta = int(solid_angle_preset["solid_angle_base_n_theta"])
+        solid_angle_refine_levels = int(solid_angle_preset["solid_angle_refine_levels"])
+        solid_angle_edge_samples = int(solid_angle_preset["solid_angle_edge_samples"])
+        solid_angle_chunk = int(solid_angle_preset["solid_angle_chunk"])
+    asymmetry_n_bracket_samples: int | None = None
+    asymmetry_tol: float | None = None
+    asymmetry_max_iter: int | None = None
+    asymmetry_n_theta_samples: int | None = None
+    asymmetry_n_refine_samples: int | None = None
+    asymmetry_refine_levels: int | None = None
+    asymmetry_n_boundary_samples: int | None = None
+    if operation_mode == "asymmetry_measurements" and asymmetry_advanced_tuning:
+        asymmetry_n_bracket_samples, err = parse_int(
+            "asymmetry_n_bracket_samples", "Asymmetry bracket samples"
+        )
+        if err:
+            return None, err
+        asymmetry_tol, err = parse_float(
+            "asymmetry_tol", "Asymmetry alpha tolerance"
+        )
+        if err:
+            return None, err
+        asymmetry_max_iter, err = parse_int(
+            "asymmetry_max_iter", "Asymmetry max iterations"
+        )
+        if err:
+            return None, err
+        asymmetry_n_theta_samples, err = parse_int(
+            "asymmetry_n_theta_samples", "Asymmetry theta samples"
+        )
+        if err:
+            return None, err
+        asymmetry_n_refine_samples, err = parse_int(
+            "asymmetry_n_refine_samples", "Asymmetry refine samples"
+        )
+        if err:
+            return None, err
+        asymmetry_refine_levels, err = parse_int(
+            "asymmetry_refine_levels", "Asymmetry refine levels"
+        )
+        if err:
+            return None, err
+        asymmetry_n_boundary_samples, err = parse_int(
+            "asymmetry_n_boundary_samples", "Asymmetry boundary samples"
+        )
+        if err:
+            return None, err
+    else:
+        asymmetry_preset = asymmetry_performance_profile_preset(asymmetry_profile)
+        asymmetry_n_bracket_samples = int(asymmetry_preset["n_bracket_samples"])
+        asymmetry_tol = float(asymmetry_preset["tol"])
+        asymmetry_max_iter = int(asymmetry_preset["max_iter"])
+        asymmetry_n_theta_samples = int(asymmetry_preset["n_theta_samples"])
+        asymmetry_n_refine_samples = int(asymmetry_preset["n_refine_samples"])
+        asymmetry_refine_levels = int(asymmetry_preset["refine_levels"])
+        asymmetry_n_boundary_samples = int(asymmetry_preset["n_boundary_samples"])
 
     assert m is not None and a is not None and r_obs is not None
     assert theta_obs_deg is not None
@@ -648,6 +944,10 @@ def parse_state(
     assert solid_angle_base_n_alpha is not None and solid_angle_base_n_theta is not None
     assert solid_angle_refine_levels is not None
     assert solid_angle_edge_samples is not None and solid_angle_chunk is not None
+    assert asymmetry_n_bracket_samples is not None and asymmetry_tol is not None
+    assert asymmetry_max_iter is not None and asymmetry_n_theta_samples is not None
+    assert asymmetry_n_refine_samples is not None and asymmetry_refine_levels is not None
+    assert asymmetry_n_boundary_samples is not None
 
     if m <= 0:
         return None, "BH mass must be > 0"
@@ -669,7 +969,7 @@ def parse_state(
             return None, "Output width and height must both be > 0"
         if n_x <= 0 or n_y <= 0:
             return None, "Stripe counts must both be > 0"
-    else:
+    elif operation_mode == "shadow_solid_angle":
         if shadow_metric == "kerr":
             if abs(a) > 1.0:
                 return None, "Dimensionless Kerr spin a/M must be between -1 and 1"
@@ -688,6 +988,30 @@ def parse_state(
                 return None, "Solid-angle edge samples must be > 0"
             if solid_angle_chunk <= 0:
                 return None, "Solid-angle chunk size must be > 0"
+    else:
+        if abs(a) > 1.0:
+            return None, "Dimensionless BH spin a/M must be between -1 and 1"
+        if theta_obs_deg < 0 or theta_obs_deg > 180:
+            return None, "Observer inclination must be in [0, 180] degrees"
+        if not np.isclose(a, 0.0) and np.isclose(np.sin(np.radians(theta_obs_deg)), 0.0):
+            return None, (
+                "For Kerr, observer inclination must avoid exact 0 or 180 degrees "
+                "with the current tracer"
+            )
+        if asymmetry_n_bracket_samples < 2:
+            return None, "Asymmetry bracket samples must be >= 2"
+        if asymmetry_tol <= 0:
+            return None, "Asymmetry alpha tolerance must be > 0"
+        if asymmetry_max_iter <= 0:
+            return None, "Asymmetry max iterations must be > 0"
+        if asymmetry_n_theta_samples < 8:
+            return None, "Asymmetry theta samples must be >= 8"
+        if asymmetry_n_refine_samples < 3:
+            return None, "Asymmetry refine samples must be >= 3"
+        if asymmetry_refine_levels < 0:
+            return None, "Asymmetry refine levels must be >= 0"
+        if asymmetry_n_boundary_samples < 8:
+            return None, "Asymmetry boundary samples must be >= 8"
 
     input_image = str(state["input_image"]).strip()
     output_image = str(state["output_image"]).strip()
@@ -707,6 +1031,11 @@ def parse_state(
         source_mode=source_mode,
         shadow_metric=shadow_metric,
         solid_angle_profile=solid_angle_profile,
+        solid_angle_advanced_tuning=solid_angle_advanced_tuning,
+        asymmetry_measurement=asymmetry_measurement,
+        asymmetry_profile=asymmetry_profile,
+        asymmetry_advanced_tuning=asymmetry_advanced_tuning,
+        asymmetry_circle_fit=asymmetry_circle_fit,
         input_image=input_image,
         output_image=output_image,
         width=width,
@@ -726,6 +1055,13 @@ def parse_state(
         solid_angle_refine_levels=solid_angle_refine_levels,
         solid_angle_edge_samples=solid_angle_edge_samples,
         solid_angle_chunk=solid_angle_chunk,
+        asymmetry_n_bracket_samples=asymmetry_n_bracket_samples,
+        asymmetry_tol=asymmetry_tol,
+        asymmetry_max_iter=asymmetry_max_iter,
+        asymmetry_n_theta_samples=asymmetry_n_theta_samples,
+        asymmetry_n_refine_samples=asymmetry_n_refine_samples,
+        asymmetry_refine_levels=asymmetry_refine_levels,
+        asymmetry_n_boundary_samples=asymmetry_n_boundary_samples,
         debug=bool(state["debug"]),
         benchmark=bool(state["benchmark"]),
         wrap_outside_background_plane=bool(state["wrap_outside_background_plane"]),
@@ -792,6 +1128,8 @@ def draw_form(
     def field_scope_label(key: str) -> str:
         if key in SHADOW_KERR_ONLY_FIELDS:
             return "Shadow mode / Kerr only"
+        if key in ASYMMETRY_ONLY_FIELDS:
+            return "Asymmetry mode only"
         if key in LENSING_ONLY_FIELDS:
             return "Lensing mode only"
         if key in SHADOW_ONLY_FIELDS:
@@ -804,10 +1142,15 @@ def draw_form(
 
     def field_constraint_text(key: str) -> str:
         constraints = {
-            "operation_mode": "Allowed values: lensing or shadow_solid_angle.",
+            "operation_mode": "Allowed values: lensing, shadow_solid_angle, or asymmetry_measurements.",
             "source_mode": "Allowed values: image or stripes.",
             "shadow_metric": "Allowed values: kerr or schwarzschild.",
             "solid_angle_profile": "Allowed values: quick, normal, accurate, or ultra_accurate. Selecting one loads the corresponding Kerr integration preset.",
+            "solid_angle_advanced_tuning": "Shadow mode / Kerr only. Off means the profile controls the hidden numeric integration settings; on reveals those settings for manual overrides.",
+            "asymmetry_measurement": "Allowed values: all or any registered asymmetry measurement method.",
+            "asymmetry_profile": "Allowed values: quick, normal, accurate, or ultra_accurate. Selecting one loads the corresponding asymmetry integration preset.",
+            "asymmetry_advanced_tuning": "Asymmetry mode only. Off means the profile controls the hidden numeric tuning settings; on reveals those settings for manual overrides.",
+            "asymmetry_circle_fit": "Asymmetry mode only. Allowed values: global or cardinal. This only affects the circularity measurement.",
             "input_image": "Must point to an existing file when Mode is image.",
             "output_image": "Lensing mode only. Cannot be empty. Existing files may be overwritten.",
             "width": "Enter an integer greater than 0.",
@@ -827,6 +1170,13 @@ def draw_form(
             "solid_angle_refine_levels": "Kerr shadow mode only. Enter an integer greater than or equal to 0.",
             "solid_angle_edge_samples": "Kerr shadow mode only. Enter an integer greater than 0.",
             "solid_angle_chunk": "Kerr shadow mode only. Enter an integer greater than 0.",
+            "asymmetry_n_bracket_samples": "Asymmetry mode only. Enter an integer greater than or equal to 2.",
+            "asymmetry_tol": "Asymmetry mode only. Enter a positive number.",
+            "asymmetry_max_iter": "Asymmetry mode only. Enter an integer greater than 0.",
+            "asymmetry_n_theta_samples": "Asymmetry mode only. Enter an integer greater than or equal to 8.",
+            "asymmetry_n_refine_samples": "Asymmetry mode only. Enter an integer greater than or equal to 3.",
+            "asymmetry_refine_levels": "Asymmetry mode only. Enter an integer greater than or equal to 0.",
+            "asymmetry_n_boundary_samples": "Asymmetry mode only. Enter an integer greater than or equal to 8.",
             "debug": "Useful when you want metric setup and progress logs.",
             "benchmark": "Adds a timing summary after the render completes.",
             "wrap_outside_background_plane": "Ignored in stripes mode.",
@@ -1124,8 +1474,7 @@ def run_form(stdscr: Any, base_config: AppConfig) -> None:
                 spec = visible_fields[cursor]
                 key = spec["key"]
                 if spec["kind"] == "bool":
-                    state[key] = not state[key]
-                    status = f"{spec['label']} set to {state[key]}"
+                    status = apply_bool_change(state, key, spec["label"])
                 elif spec["kind"] == "choice":
                     status = apply_choice_change(state, key, spec["label"])
             continue
@@ -1139,8 +1488,7 @@ def run_form(stdscr: Any, base_config: AppConfig) -> None:
             kind = spec["kind"]
 
             if kind == "bool":
-                state[key] = not state[key]
-                status = f"{spec['label']} set to {state[key]}"
+                status = apply_bool_change(state, key, spec["label"])
                 continue
             if kind == "choice":
                 status = apply_choice_change(state, key, spec["label"])
@@ -1199,24 +1547,62 @@ def run_form(stdscr: Any, base_config: AppConfig) -> None:
                         )
                 append_log(f"Output will be saved to '{config.output_image}'")
                 run_info["stage_label"] = "Preparing"
-            else:
+            elif config.operation_mode == "shadow_solid_angle":
                 append_log(
                     f"Using {SHADOW_METRIC_LABELS[config.shadow_metric]} "
                     f"with M={append_unit(config.M, 'M')}, "
                     f"r_obs={append_unit(config.r_obs, 'M')}"
                 )
                 if config.shadow_metric == "kerr":
-                    append_log(
-                        f"profile={format_choice_value('solid_angle_profile', config.solid_angle_profile)}, "
-                        f"spin={append_unit(config.a, 'a/M')}, "
-                        f"theta_obs={append_unit(config.theta_obs_deg, 'deg')}, "
-                        f"grid={format_field_value('solid_angle_base_n_alpha', config.solid_angle_base_n_alpha)} x "
-                        f"{format_field_value('solid_angle_base_n_theta', config.solid_angle_base_n_theta)}, "
-                        f"refine={format_field_value('solid_angle_refine_levels', config.solid_angle_refine_levels)}, "
-                        f"edge={format_field_value('solid_angle_edge_samples', config.solid_angle_edge_samples)}, "
-                        f"chunk={format_field_value('solid_angle_chunk', config.solid_angle_chunk)}"
-                    )
+                    if config.solid_angle_advanced_tuning:
+                        append_log(
+                            f"profile={format_choice_value('solid_angle_profile', config.solid_angle_profile)}, "
+                            f"spin={append_unit(config.a, 'a/M')}, "
+                            f"theta_obs={append_unit(config.theta_obs_deg, 'deg')}, "
+                            f"grid={format_field_value('solid_angle_base_n_alpha', config.solid_angle_base_n_alpha)} x "
+                            f"{format_field_value('solid_angle_base_n_theta', config.solid_angle_base_n_theta)}, "
+                            f"refine={format_field_value('solid_angle_refine_levels', config.solid_angle_refine_levels)}, "
+                            f"edge={format_field_value('solid_angle_edge_samples', config.solid_angle_edge_samples)}, "
+                            f"chunk={format_field_value('solid_angle_chunk', config.solid_angle_chunk)}"
+                        )
+                    else:
+                        append_log(
+                            f"profile={format_choice_value('solid_angle_profile', config.solid_angle_profile)}, "
+                            f"spin={append_unit(config.a, 'a/M')}, "
+                            f"theta_obs={append_unit(config.theta_obs_deg, 'deg')}, "
+                            "advanced numeric tuning hidden"
+                        )
                 run_info["stage_label"] = "Compute solid angle"
+            else:
+                append_log(
+                    f"Using metric parameters M={append_unit(config.M, 'M')}, "
+                    f"spin={append_unit(config.a, 'a/M')}, "
+                    f"r_obs={append_unit(config.r_obs, 'M')}, "
+                    f"theta_obs={append_unit(config.theta_obs_deg, 'deg')}"
+                )
+                append_log(
+                    "Measurement selection: "
+                    f"{format_choice_value('asymmetry_measurement', config.asymmetry_measurement)}"
+                )
+                if config.asymmetry_advanced_tuning:
+                    append_log(
+                        f"profile={format_choice_value('asymmetry_profile', config.asymmetry_profile)}, "
+                        f"circle_fit={format_choice_value('asymmetry_circle_fit', config.asymmetry_circle_fit)}, "
+                        f"bracket={format_field_value('asymmetry_n_bracket_samples', config.asymmetry_n_bracket_samples)}, "
+                        f"tol={format_field_value('asymmetry_tol', config.asymmetry_tol)}, "
+                        f"max_iter={format_field_value('asymmetry_max_iter', config.asymmetry_max_iter)}, "
+                        f"theta={format_field_value('asymmetry_n_theta_samples', config.asymmetry_n_theta_samples)}, "
+                        f"refine_samples={format_field_value('asymmetry_n_refine_samples', config.asymmetry_n_refine_samples)}, "
+                        f"levels={format_field_value('asymmetry_refine_levels', config.asymmetry_refine_levels)}, "
+                        f"boundary={format_field_value('asymmetry_n_boundary_samples', config.asymmetry_n_boundary_samples)}"
+                    )
+                else:
+                    append_log(
+                        f"profile={format_choice_value('asymmetry_profile', config.asymmetry_profile)}, "
+                        f"circle_fit={format_choice_value('asymmetry_circle_fit', config.asymmetry_circle_fit)}, "
+                        "advanced numeric tuning hidden"
+                    )
+                run_info["stage_label"] = "Measure asymmetry"
             run_info["stage_percent"] = 0.0
             run_info["overall_percent"] = 0.0
             usage = ProcessUsageSampler()
@@ -1255,8 +1641,10 @@ def run_form(stdscr: Any, base_config: AppConfig) -> None:
                         metric_debug=False,
                         progress=update_progress,
                     )
-                else:
+                elif config.operation_mode == "shadow_solid_angle":
                     run_shadow_solid_angle(config, log=append_log, progress=update_progress)
+                else:
+                    run_asymmetry_measurements(config, log=append_log, progress=update_progress)
             except Exception as exc:  # pragma: no cover - user-facing error path
                 append_log(f"Error: {exc}")
                 status = f"Run failed: {exc}"
@@ -1269,8 +1657,10 @@ def run_form(stdscr: Any, base_config: AppConfig) -> None:
             run_info["ram_mb"] = ram_mb
             if config.operation_mode == "lensing":
                 status = "Generation complete. You can edit and run again."
-            else:
+            elif config.operation_mode == "shadow_solid_angle":
                 status = "Solid-angle computation complete."
+            else:
+                status = "Asymmetry measurements complete."
 
 
 def benchmark_summary_lines(
@@ -1369,6 +1759,65 @@ def shadow_benchmark_summary_lines(
     ]
 
 
+def asymmetry_benchmark_summary_lines(
+    metric: Any,
+    measurement_names: tuple[str, ...],
+    timings: dict[str, float],
+    measurement_stats: dict[str, dict[str, Any]],
+) -> list[str]:
+    total_time = max(timings.get("total", 0.0), 1e-12)
+    total_trace_rays = sum(int(stats.get("trace_ray_calls", 0)) for stats in measurement_stats.values())
+    total_trace_outcomes = sum(
+        int(stats.get("trace_outcome_calls", 0)) for stats in measurement_stats.values()
+    )
+    total_invalid_results = sum(
+        int(stats.get("invalid_trace_results", 0)) for stats in measurement_stats.values()
+    )
+    total_alpha_crit_calls = sum(
+        int(stats.get("alpha_crit_calls", 0)) for stats in measurement_stats.values()
+    )
+    total_boundary_requests = sum(
+        int(stats.get("boundary_point_requests", 0)) for stats in measurement_stats.values()
+    )
+    total_boundary_samples = sum(
+        int(stats.get("boundary_samples_requested", 0)) for stats in measurement_stats.values()
+    )
+    total_cache_hits = sum(int(stats.get("point_cache_hits", 0)) for stats in measurement_stats.values())
+    total_cache_misses = sum(
+        int(stats.get("point_cache_misses", 0)) for stats in measurement_stats.values()
+    )
+    total_trace_time_raw = sum(float(stats.get("trace_time", 0.0)) for stats in measurement_stats.values())
+    lines = [
+        "Asymmetry benchmark",
+        f"  metric: {type(metric).__name__}",
+        f"  measurements: {len(measurement_names)}",
+        f"  trace rays: {append_unit(f'{total_trace_rays:,}', 'rays')}",
+        f"  trace outcomes: {append_unit(f'{total_trace_outcomes:,}', 'outcomes')}",
+        f"  invalid results: {append_unit(f'{total_invalid_results:,}', 'results')}",
+        f"  alpha_crit calls: {append_unit(f'{total_alpha_crit_calls:,}', 'calls')}",
+        f"  boundary requests: {append_unit(f'{total_boundary_requests:,}', 'requests')}",
+        f"  boundary samples: {append_unit(f'{total_boundary_samples:,}', 'samples')}",
+        f"  cache hits: {append_unit(f'{total_cache_hits:,}', 'hits')}",
+        f"  cache misses: {append_unit(f'{total_cache_misses:,}', 'misses')}",
+    ]
+    for name in measurement_names:
+        stats = measurement_stats.get(name, {})
+        lines.append(
+            f"  {name:<26}{timings.get(name, 0.0):>10.3f} s"
+            f" | {int(stats.get('trace_ray_calls', 0)):>8,} rays"
+            f" | {int(stats.get('alpha_crit_calls', 0)):>6,} alpha_crit"
+        )
+    lines.append(f"  {'trace_time':<26}{total_trace_time_raw:>10.3f} s")
+    lines.append(f"  {'total':<26}{timings.get('total', 0.0):>10.3f} s")
+    lines.append(
+        f"  {'trace_throughput':<26}{format_ray_rate(total_trace_rays, total_trace_time_raw):>10}"
+    )
+    lines.append(
+        f"  {'measurements_per_second':<26}{(len(measurement_names) / total_time):>10.2f}"
+    )
+    return lines
+
+
 def overall_progress_percent(stage_key: str, stage_fraction: float) -> float:
     clamped_stage = max(0.0, min(1.0, stage_fraction))
     total = 0.0
@@ -1389,6 +1838,203 @@ def metric_spin_over_mass(metric: Any) -> float:
     if np.isclose(metric_mass, 0.0):
         return 0.0
     return float(getattr(metric, "a", 0.0)) / metric_mass
+
+
+def build_observer_metric(config: AppConfig) -> Schwarzschild | Kerr:
+    if np.isclose(config.a, 0.0):
+        return Schwarzschild(M=config.M)
+    return Kerr(M=config.M, a=spin_mass_units_to_kerr_a(config.M, config.a))
+
+
+def selected_asymmetry_measurement_names(config: AppConfig) -> tuple[str, ...]:
+    if config.asymmetry_measurement == "all":
+        return AsymmetryMeasurements.measurement_names()
+    return (config.asymmetry_measurement,)
+
+
+def asymmetry_measurement_kwargs(config: AppConfig) -> dict[str, Any]:
+    return {
+        "circle_fit": config.asymmetry_circle_fit,
+        "n_bracket_samples": config.asymmetry_n_bracket_samples,
+        "tol": config.asymmetry_tol,
+        "max_iter": config.asymmetry_max_iter,
+        "n_theta_samples": config.asymmetry_n_theta_samples,
+        "n_refine_samples": config.asymmetry_n_refine_samples,
+        "refine_levels": config.asymmetry_refine_levels,
+        "n_boundary_samples": config.asymmetry_n_boundary_samples,
+    }
+
+
+def emit_asymmetry_measurement_value(
+    emit: Callable[[str], None],
+    name: str,
+    value: Any,
+) -> None:
+    if isinstance(value, dict):
+        emit(f"{name}:")
+        for key, subvalue in value.items():
+            if isinstance(subvalue, (float, int, np.floating, np.integer)):
+                emit(f"  {key:<20} = {float(subvalue):.10f}")
+            else:
+                emit(f"  {key:<20} = {subvalue}")
+        return
+
+    if isinstance(value, (float, int, np.floating, np.integer)):
+        emit(f"{name:<22} = {float(value):.10f}")
+        return
+
+    emit(f"{name:<22} = {value}")
+
+
+def run_asymmetry_measurements(
+    config: AppConfig,
+    log: Callable[[str], None] | None = None,
+    progress: Callable[[str, float, float], None] | None = None,
+    show_progress: bool | None = None,
+) -> None:
+    def emit(message: str) -> None:
+        if log is None:
+            print(message)
+        else:
+            log(message)
+
+    if show_progress is None:
+        show_progress = config.debug and progress is None and log is None
+
+    last_progress_time = perf_counter()
+    last_progress_overall = -1.0
+
+    def emit_progress(stage_label: str, stage_fraction: float, overall_fraction: float) -> None:
+        nonlocal last_progress_time, last_progress_overall
+        stage_fraction = max(0.0, min(1.0, stage_fraction))
+        overall_fraction = max(0.0, min(1.0, overall_fraction))
+        stage_percent = 100.0 * stage_fraction
+        overall_percent = 100.0 * overall_fraction
+        if progress is not None:
+            progress(stage_label, stage_percent, overall_percent)
+            return
+        if not show_progress:
+            return
+        now = perf_counter()
+        if (
+            overall_fraction < 1.0
+            and abs(overall_fraction - last_progress_overall) < 0.08
+            and (now - last_progress_time) < 0.5
+        ):
+            return
+        print(
+            f"[asymmetry] {make_progress_bar(overall_percent, width=24)} "
+            f"{overall_percent:6.2f}% total | {stage_label:<28} {stage_percent:6.2f}% stage"
+        )
+        last_progress_time = now
+        last_progress_overall = overall_fraction
+
+    metric = build_observer_metric(config)
+    r_obs = config.r_obs * metric.M
+    theta_obs = np.radians(config.theta_obs_deg)
+    measurements = AsymmetryMeasurements(metric, r_obs, theta_obs)
+    measurement_names = selected_asymmetry_measurement_names(config)
+    common_kwargs = asymmetry_measurement_kwargs(config)
+    measurement_plan: list[tuple[str, dict[str, Any], float]] = []
+    for name in measurement_names:
+        measurement_kwargs = filter_asymmetry_measurement_kwargs(name, common_kwargs)
+        estimated_work_units = float(
+            AsymmetryMeasurements.estimate_measurement_work_units(name, **measurement_kwargs)
+        )
+        measurement_plan.append((name, measurement_kwargs, max(estimated_work_units, 1.0)))
+    total_estimated_work = max(
+        1.0,
+        float(sum(estimated_work_units for _, _, estimated_work_units in measurement_plan)),
+    )
+
+    timings: dict[str, float] = {}
+    measurement_stats: dict[str, dict[str, Any]] = {}
+    total_start = perf_counter() if config.benchmark else None
+
+    if config.debug:
+        metric_mass = append_unit(f"{metric.M:g}", "M")
+        metric_spin = append_unit(f"{metric_spin_over_mass(metric):g}", "a/M")
+        metric_a = append_unit(f"{getattr(metric, 'a', 0.0):g}", "M")
+        emit(
+            f"Metric: {type(metric).__name__} "
+            f"(M={metric_mass}, spin={metric_spin}, a={metric_a})"
+        )
+
+    emit("Asymmetry measurements")
+    emit(f"M                     = {append_unit(config.M, 'M')}")
+    emit(f"spin                  = {append_unit(config.a, 'a/M')}")
+    emit(f"a                     = {append_unit(getattr(metric, 'a', 0.0), 'M')}")
+    emit(f"r_obs                 = {append_unit(r_obs, 'M')}")
+    emit(f"theta_obs             = {config.theta_obs_deg:.6f} deg")
+    emit(f"profile               = {format_choice_value('asymmetry_profile', config.asymmetry_profile)}")
+    emit(
+        f"advanced tuning       = "
+        f"{'On' if config.asymmetry_advanced_tuning else 'Off'}"
+    )
+    emit(
+        f"circle algorithm      = "
+        f"{format_choice_value('asymmetry_circle_fit', config.asymmetry_circle_fit)}"
+    )
+    if config.asymmetry_advanced_tuning:
+        emit(
+            "sampling              = "
+            f"bracket={config.asymmetry_n_bracket_samples}, "
+            f"tol={config.asymmetry_tol:g} rad, "
+            f"max_iter={config.asymmetry_max_iter}, "
+            f"theta={config.asymmetry_n_theta_samples}, "
+            f"refine_samples={config.asymmetry_n_refine_samples}, "
+            f"refine_levels={config.asymmetry_refine_levels}, "
+            f"boundary={config.asymmetry_n_boundary_samples}"
+        )
+    else:
+        emit("sampling              = controlled by asymmetry profile preset")
+    emit("selected measurements = " + ", ".join(measurement_names))
+
+    emit_progress("Measure asymmetry", 0.0, 0.0)
+
+    completed_work = 0.0
+    monitor_enabled = config.benchmark or progress is not None or show_progress
+    for name, measurement_kwargs, estimated_work_units in measurement_plan:
+        stage_label = name.replace("_", " ")
+        if monitor_enabled:
+            def measurement_progress(done_units: float, total_units: float, *, offset=completed_work, estimate=estimated_work_units, label=stage_label) -> None:
+                measurement_total = max(float(total_units), float(estimate), 1e-12)
+                bounded_done = max(0.0, min(float(done_units), measurement_total))
+                emit_progress(
+                    label,
+                    bounded_done / measurement_total,
+                    min(1.0, (offset + bounded_done) / total_estimated_work),
+                )
+
+            measurements.begin_measurement_run(
+                name,
+                estimated_work_units=estimated_work_units,
+                progress_callback=measurement_progress,
+            )
+        start = perf_counter() if config.benchmark else None
+        try:
+            value = measurements.measure(name, **measurement_kwargs)
+        except Exception:
+            if monitor_enabled:
+                measurement_stats[name] = measurements.finish_measurement_run(completed=False)
+            raise
+        if monitor_enabled:
+            measurement_stats[name] = measurements.finish_measurement_run(completed=True)
+        if config.benchmark and start is not None:
+            timings[name] = perf_counter() - start
+        emit_asymmetry_measurement_value(emit, name, value)
+        completed_work += estimated_work_units
+
+    if config.benchmark and total_start is not None:
+        timings["total"] = perf_counter() - total_start
+        for line in asymmetry_benchmark_summary_lines(
+            metric,
+            measurement_names,
+            timings,
+            measurement_stats,
+        ):
+            emit(line)
+    emit_progress("Asymmetry complete", 1.0, 1.0)
 
 
 def run_shadow_solid_angle(
@@ -1477,16 +2123,23 @@ def run_shadow_solid_angle(
             "integration profile   = "
             f"{format_choice_value('solid_angle_profile', config.solid_angle_profile)}"
         )
+        emit(
+            f"advanced tuning       = "
+            f"{'On' if config.solid_angle_advanced_tuning else 'Off'}"
+        )
         emit(f"shadow solid angle    = {omega:.10f} sr")
         emit(f"fraction of full sky  = {fraction:.10%}")
-        emit(
-            "integration settings  = "
-            f"{format_field_value('solid_angle_base_n_alpha', config.solid_angle_base_n_alpha)} x "
-            f"{format_field_value('solid_angle_base_n_theta', config.solid_angle_base_n_theta)}, "
-            f"refine={format_field_value('solid_angle_refine_levels', config.solid_angle_refine_levels)}, "
-            f"edge={format_field_value('solid_angle_edge_samples', config.solid_angle_edge_samples)}, "
-            f"chunk={format_field_value('solid_angle_chunk', config.solid_angle_chunk)}"
-        )
+        if config.solid_angle_advanced_tuning:
+            emit(
+                "integration settings  = "
+                f"{format_field_value('solid_angle_base_n_alpha', config.solid_angle_base_n_alpha)} x "
+                f"{format_field_value('solid_angle_base_n_theta', config.solid_angle_base_n_theta)}, "
+                f"refine={format_field_value('solid_angle_refine_levels', config.solid_angle_refine_levels)}, "
+                f"edge={format_field_value('solid_angle_edge_samples', config.solid_angle_edge_samples)}, "
+                f"chunk={format_field_value('solid_angle_chunk', config.solid_angle_chunk)}"
+            )
+        else:
+            emit("integration settings  = controlled by solid-angle profile preset")
 
     if config.benchmark:
         for line in shadow_benchmark_summary_lines(config, stats):
@@ -1517,11 +2170,7 @@ def run_lensing(
         stage_pct = max(0.0, min(100.0, stage_fraction * 100.0))
         progress(STAGE_LABELS[stage_key], stage_pct, overall_progress_percent(stage_key, stage_fraction))
 
-    metric = (
-        Schwarzschild(M=config.M)
-        if np.isclose(config.a, 0.0)
-        else Kerr(M=config.M, a=spin_mass_units_to_kerr_a(config.M, config.a))
-    )
+    metric = build_observer_metric(config)
 
     timings: dict[str, float] = {}
     total_start = perf_counter() if config.benchmark else None
@@ -1754,7 +2403,10 @@ def run_lensing(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Interactive wrapper around lens rendering and shadow solid-angle tools"
+        description=(
+            "Interactive wrapper around lens rendering, shadow solid-angle, "
+            "and asymmetry-measurement tools"
+        )
     )
     parser.add_argument(
         "--no-ui",
@@ -1763,9 +2415,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=("lensing", "shadow-solid-angle"),
+        choices=("lensing", "shadow-solid-angle", "asymmetry-measurements"),
         default="lensing",
-        help="Top-level mode: render a lensing image or compute shadow solid angle",
+        help=(
+            "Top-level mode: render a lensing image, compute shadow solid angle, "
+            "or print asymmetry measurements"
+        ),
     )
     parser.add_argument(
         "--source-mode",
@@ -1784,6 +2439,34 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("quick", "normal", "accurate", "ultra-accurate"),
         default="normal",
         help="Preset for Kerr shadow solid-angle integration; explicit solid-angle knobs override it",
+    )
+    parser.add_argument(
+        "--solid-angle-advanced-tuning",
+        action="store_true",
+        help="Enable the individual solid-angle integration knobs instead of using only the selected profile",
+    )
+    parser.add_argument(
+        "--asymmetry-measurement",
+        choices=ASYMMETRY_MEASUREMENT_VALUES,
+        default="all",
+        help="Asymmetry mode only. Choose one measurement or 'all'.",
+    )
+    parser.add_argument(
+        "--asymmetry-profile",
+        choices=("quick", "normal", "accurate", "ultra-accurate"),
+        default="normal",
+        help="Preset for asymmetry sampling and refinement; explicit asymmetry knobs override it",
+    )
+    parser.add_argument(
+        "--asymmetry-advanced-tuning",
+        action="store_true",
+        help="Enable the individual asymmetry performance knobs instead of using only the selected profile",
+    )
+    parser.add_argument(
+        "--asymmetry-circle-fit",
+        choices=ASYMMETRY_CIRCLE_FIT_CHOICES,
+        default="global",
+        help="Circle-fit algorithm used by the circularity measurement",
     )
     parser.add_argument("--input-image", default="image.jpg", help="Background image path")
     parser.add_argument("--output-image", default="lensed_image.png", help="Output image path")
@@ -1857,6 +2540,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="Batch size for Kerr shadow solid-angle ray tracing",
     )
     parser.add_argument(
+        "--asymmetry-n-bracket-samples",
+        type=int,
+        default=None,
+        help="Coarse alpha sample count used to bracket alpha_crit(theta)",
+    )
+    parser.add_argument(
+        "--asymmetry-tol",
+        type=float,
+        default=None,
+        help="Bisection stopping tolerance for alpha_crit(theta)",
+    )
+    parser.add_argument(
+        "--asymmetry-max-iter",
+        type=int,
+        default=None,
+        help="Maximum bisection iterations used while refining alpha_crit(theta)",
+    )
+    parser.add_argument(
+        "--asymmetry-n-theta-samples",
+        type=int,
+        default=None,
+        help="Coarse theta sample count used to search for shadow extrema",
+    )
+    parser.add_argument(
+        "--asymmetry-n-refine-samples",
+        type=int,
+        default=None,
+        help="Samples per extremum-refinement pass in asymmetry mode",
+    )
+    parser.add_argument(
+        "--asymmetry-refine-levels",
+        type=int,
+        default=None,
+        help="Number of extremum-refinement rounds in asymmetry mode",
+    )
+    parser.add_argument(
+        "--asymmetry-n-boundary-samples",
+        type=int,
+        default=None,
+        help="Full-boundary sample count used by circularity measurements",
+    )
+    parser.add_argument(
         "--wrap-outside-background-plane",
         action="store_true",
         help=(
@@ -1873,15 +2598,41 @@ def main() -> int:
     args = parser.parse_args()
     solid_angle_profile = args.solid_angle_profile.replace("-", "_")
     solid_angle_preset = solid_angle_profile_preset(solid_angle_profile)
+    solid_angle_advanced_tuning = bool(
+        args.solid_angle_advanced_tuning
+        or args.solid_angle_base_n_alpha is not None
+        or args.solid_angle_base_n_theta is not None
+        or args.solid_angle_refine_levels is not None
+        or args.solid_angle_edge_samples is not None
+        or args.solid_angle_chunk is not None
+    )
+    asymmetry_profile = args.asymmetry_profile.replace("-", "_")
+    asymmetry_preset = asymmetry_performance_profile_preset(asymmetry_profile)
+    asymmetry_advanced_tuning = bool(
+        args.asymmetry_advanced_tuning
+        or args.asymmetry_n_bracket_samples is not None
+        or args.asymmetry_tol is not None
+        or args.asymmetry_max_iter is not None
+        or args.asymmetry_n_theta_samples is not None
+        or args.asymmetry_n_refine_samples is not None
+        or args.asymmetry_refine_levels is not None
+        or args.asymmetry_n_boundary_samples is not None
+    )
 
     seed_config = AppConfig(
         operation_mode=(
             "shadow_solid_angle" if (args.solid_angle_only or args.mode == "shadow-solid-angle")
+            else "asymmetry_measurements" if args.mode == "asymmetry-measurements"
             else "lensing"
         ),
         source_mode=args.source_mode,
         shadow_metric=args.shadow_metric,
         solid_angle_profile=solid_angle_profile,
+        solid_angle_advanced_tuning=solid_angle_advanced_tuning,
+        asymmetry_measurement=args.asymmetry_measurement,
+        asymmetry_profile=asymmetry_profile,
+        asymmetry_advanced_tuning=asymmetry_advanced_tuning,
+        asymmetry_circle_fit=args.asymmetry_circle_fit,
         input_image=args.input_image,
         output_image=args.output_image,
         width=args.width,
@@ -1921,26 +2672,45 @@ def main() -> int:
             if args.solid_angle_chunk is not None
             else solid_angle_preset["solid_angle_chunk"]
         ),
+        asymmetry_n_bracket_samples=(
+            args.asymmetry_n_bracket_samples
+            if args.asymmetry_n_bracket_samples is not None
+            else asymmetry_preset["n_bracket_samples"]
+        ),
+        asymmetry_tol=(
+            args.asymmetry_tol
+            if args.asymmetry_tol is not None
+            else asymmetry_preset["tol"]
+        ),
+        asymmetry_max_iter=(
+            args.asymmetry_max_iter
+            if args.asymmetry_max_iter is not None
+            else asymmetry_preset["max_iter"]
+        ),
+        asymmetry_n_theta_samples=(
+            args.asymmetry_n_theta_samples
+            if args.asymmetry_n_theta_samples is not None
+            else asymmetry_preset["n_theta_samples"]
+        ),
+        asymmetry_n_refine_samples=(
+            args.asymmetry_n_refine_samples
+            if args.asymmetry_n_refine_samples is not None
+            else asymmetry_preset["n_refine_samples"]
+        ),
+        asymmetry_refine_levels=(
+            args.asymmetry_refine_levels
+            if args.asymmetry_refine_levels is not None
+            else asymmetry_preset["refine_levels"]
+        ),
+        asymmetry_n_boundary_samples=(
+            args.asymmetry_n_boundary_samples
+            if args.asymmetry_n_boundary_samples is not None
+            else asymmetry_preset["n_boundary_samples"]
+        ),
         debug=args.debug,
         benchmark=args.benchmark,
         wrap_outside_background_plane=args.wrap_outside_background_plane,
     )
-
-    if seed_config.operation_mode == "shadow_solid_angle" and args.no_ui:
-        state = config_to_state(seed_config)
-        config, err = parse_state(state, require_source_assets=False)
-        if err:
-            print(f"Validation error: {err}")
-            return 2
-        assert config is not None
-        try:
-            run_shadow_solid_angle(config)
-        except Exception as exc:  # pragma: no cover - user-facing error path
-            print(f"Error: {exc}")
-            if config.debug:
-                raise
-            return 1
-        return 0
 
     if args.no_ui:
         state = config_to_state(seed_config)
@@ -1955,8 +2725,10 @@ def main() -> int:
         try:
             if config.operation_mode == "lensing":
                 run_lensing(config)
-            else:
+            elif config.operation_mode == "shadow_solid_angle":
                 run_shadow_solid_angle(config)
+            else:
+                run_asymmetry_measurements(config)
         except Exception as exc:  # pragma: no cover - user-facing error path
             print(f"Error: {exc}")
             if config.debug:
