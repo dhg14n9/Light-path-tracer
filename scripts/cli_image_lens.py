@@ -36,6 +36,7 @@ from light_path_tracer.image_lens import (
     render_lensed_image as render_lensed_input_image,
 )
 from light_path_tracer.metrics import Kerr, Schwarzschild
+from light_path_tracer.project_paths import default_output_path, resolve_output_path
 from light_path_tracer.solid_angle import (
     kerr_shadow_solid_angle,
     schwarzschild_shadow_solid_angle,
@@ -62,7 +63,7 @@ class AppConfig:
     asymmetry_advanced_tuning: bool = False
     asymmetry_circle_fit: str = "global"
     input_image: str = "image.jpg"
-    output_image: str = "lensed_image.png"
+    output_image: str = str(default_output_path("lensed_image.png"))
     width: int = DEFAULT_STRIPES_IMAGE_DIMENSION[1]
     height: int = DEFAULT_STRIPES_IMAGE_DIMENSION[0]
     n_x: int = DEFAULT_N_X
@@ -2387,7 +2388,7 @@ def run_lensing(
     bench_stop("render", stage_start)
     emit_progress("render", 1.0)
 
-    output_path = Path(config.output_image).expanduser()
+    output_path = resolve_output_path(config.output_image)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     emit_progress("save_image", 0.0)
@@ -2472,7 +2473,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Circle-fit algorithm used by the circularity measurement",
     )
     parser.add_argument("--input-image", default="image.jpg", help="Background image path")
-    parser.add_argument("--output-image", default="lensed_image.png", help="Output image path")
+    parser.add_argument(
+        "--output-image",
+        default=str(default_output_path("lensed_image.png")),
+        help="Output image path",
+    )
     parser.add_argument(
         "--width",
         type=int,

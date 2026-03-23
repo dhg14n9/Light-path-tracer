@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from light_path_tracer.metrics import Schwarzschild
+from light_path_tracer.project_paths import default_output_path
 
 
 def pixel_to_viewing_angle(i, n, fov):
@@ -36,9 +37,12 @@ def main(metric=None):
             alpha = np.arccos(np.cos(alpha_x) * np.cos(alpha_y))
             image[i, j] = get_pixel_color(metric, r_obs, alpha, alpha_crit)
 
+    output_path = default_output_path("black_hole_shadow.png")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     plt.imshow(image, cmap="gray", origin="lower")
     plt.axis("off")
-    plt.savefig("black_hole_shadow.png", dpi=200, bbox_inches="tight")
+    plt.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close()
 
 

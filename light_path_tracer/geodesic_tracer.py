@@ -13,6 +13,7 @@ from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt
 
 from .metrics import Schwarzschild
+from .project_paths import default_output_path
 
 
 # =============================================================================
@@ -178,7 +179,9 @@ if __name__ == '__main__':
     ax.set_xlim(-r_obs * 0.3, r_obs * 1.2)
     ax.set_ylim(-r_obs * 0.5, r_obs * 0.5)
 
+    output_path = default_output_path("geodesic_trajectories.png")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
-    plt.savefig('geodesic_trajectories.png', dpi=150, bbox_inches='tight')
-    print("Saved: geodesic_trajectories.png")
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"Saved: {output_path}")
     plt.show()

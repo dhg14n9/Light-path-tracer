@@ -24,10 +24,11 @@ from light_path_tracer.asymmetries import (
     filter_asymmetry_measurement_kwargs,
 )
 from light_path_tracer.metrics import Kerr, Schwarzschild
+from light_path_tracer.project_paths import ASYM_DATA_DIR
 
 
 SCHEMA_VERSION = "2"
-DEFAULT_RUN_ROOT = Path("data/asym_data")
+DEFAULT_RUN_ROOT = ASYM_DATA_DIR
 RUN_SETTINGS_FILENAME = "settings.json"
 RUN_DATA_FILENAME = "asymmetry_data.h5"
 RUN_BENCHMARK_FILENAME = "benchmark_summary.txt"

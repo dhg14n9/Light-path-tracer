@@ -14,8 +14,10 @@ from typing import Any
 
 import numpy as np
 
+from light_path_tracer.project_paths import ASYM_DATA_DIR
 
-RUN_ROOT = Path("data/asym_data")
+
+RUN_ROOT = ASYM_DATA_DIR
 LEGACY_RUN_ROOT = Path("asym_data")
 RUN_DIRECTORY_PATTERN = re.compile(r"run_(\d+)$")
 SETTINGS_FILENAME = "settings.json"
