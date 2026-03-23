@@ -6,7 +6,8 @@ import matplotlib.image as mpimg
 from tqdm import tqdm
 from time import perf_counter
 
-from metrics import Schwarzschild, Kerr
+from .metrics import Schwarzschild, Kerr
+from .project_paths import default_output_path
 
 
 WINDING_DTYPE = np.uint16
@@ -585,8 +586,11 @@ def main(metric=None, M=1.0, a=0.0, r_obs_mult=100.0,
     )
     _bench_stop(benchmark, timings, "render", stage_start)
 
+    output_path = default_output_path("lensed_image.png")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     stage_start = _bench_start(benchmark)
-    mpimg.imsave('lensed_image.png', lensed_image)
+    mpimg.imsave(str(output_path), lensed_image)
     _bench_stop(benchmark, timings, "save_image", stage_start)
 
     if benchmark and total_start is not None:

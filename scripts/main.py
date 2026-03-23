@@ -5,8 +5,9 @@ Example script demonstrating geodesic tracing around a black hole.
 import numpy as np
 import matplotlib.pyplot as plt
 
-from metrics import Schwarzschild
-from geodesic_tracer import trace_ray
+from light_path_tracer.metrics import Schwarzschild
+from light_path_tracer.geodesic_tracer import trace_ray
+from light_path_tracer.project_paths import default_output_path
 
 
 def main(metric=None):
@@ -66,9 +67,11 @@ def main(metric=None):
     ax.legend(loc='upper left', fontsize=10)
     ax.grid(True, alpha=0.3)
 
+    output_path = default_output_path("example_geodesic.png")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
-    plt.savefig('example_geodesic.png', dpi=150)
-    print(f"\nSaved: example_geodesic.png")
+    plt.savefig(output_path, dpi=150)
+    print(f"\nSaved: {output_path}")
     plt.show()
 
 
