@@ -21,23 +21,26 @@ from typing import Any, Callable
 import matplotlib.image as mpimg
 import numpy as np
 
-from asymmetries import (
+from light_path_tracer.asymmetries import (
     ASYMMETRY_CIRCLE_FIT_CHOICES,
     ASYMMETRY_PERFORMANCE_PROFILE_NAMES,
     AsymmetryMeasurements,
     asymmetry_performance_profile_preset,
     filter_asymmetry_measurement_kwargs,
 )
-from image_lens import (
+from light_path_tracer.image_lens import (
     _psi_to_cam_projection,
     build_alpha_lookup,
     precompute_final_alpha_lookup as precompute_final_alpha_lookup_image,
     precompute_final_alpha_lookup_2d as precompute_final_alpha_lookup_2d_image,
     render_lensed_image as render_lensed_input_image,
 )
-from metrics import Kerr, Schwarzschild
-from solid_angle import kerr_shadow_solid_angle, schwarzschild_shadow_solid_angle
-from stripes_lens import (
+from light_path_tracer.metrics import Kerr, Schwarzschild
+from light_path_tracer.solid_angle import (
+    kerr_shadow_solid_angle,
+    schwarzschild_shadow_solid_angle,
+)
+from light_path_tracer.stripes_lens import (
     DEFAULT_IMAGE_DIMENSION as DEFAULT_STRIPES_IMAGE_DIMENSION,
     DEFAULT_N_X,
     DEFAULT_N_Y,
@@ -1150,7 +1153,7 @@ def draw_form(
             "asymmetry_measurement": "Allowed values: all or any registered asymmetry measurement method.",
             "asymmetry_profile": "Allowed values: quick, normal, accurate, or ultra_accurate. Selecting one loads the corresponding asymmetry integration preset.",
             "asymmetry_advanced_tuning": "Asymmetry mode only. Off means the profile controls the hidden numeric tuning settings; on reveals those settings for manual overrides.",
-            "asymmetry_circle_fit": "Asymmetry mode only. Allowed values: global or cardinal. This only affects the circularity measurement.",
+            "asymmetry_circle_fit": "Asymmetry mode only. Allowed values: global or cardinal. This affects circularity_metrics.",
             "input_image": "Must point to an existing file when Mode is image.",
             "output_image": "Lensing mode only. Cannot be empty. Existing files may be overwritten.",
             "width": "Enter an integer greater than 0.",

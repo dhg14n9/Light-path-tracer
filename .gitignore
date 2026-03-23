@@ -23,4 +23,8 @@ Thumbs.db
 # lookup table cache
 lookup_cache.npz
 
-# cli_image_lens.py
+# generated run data and analysis output
+data/asym_data/
+*.h5
+benchmark_summary.txt
+*.html

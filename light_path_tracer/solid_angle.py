@@ -3,7 +3,7 @@ from time import perf_counter
 
 import numpy as np
 
-from metrics import Kerr
+from .metrics import Kerr
 
 try:
     from numba import njit

@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-from metrics import Schwarzschild
+from light_path_tracer.metrics import Schwarzschild
 
 
 def pixel_to_viewing_angle(i, n, fov):
